@@ -29,10 +29,12 @@ const RENEWAL_FAILURE_SUSPENSION_TURNS = 3; // per doc §3's "2-3 turns" suspens
 
 // Ingredient-directed research targets a specific tier, so it's priced
 // steeper than the flat, random-outcome Breakthrough (scenario.researchCost) —
-// paying for precision.
+// paying for precision. Doubles per tier (200/400/800/1600/3200...) rather
+// than scaling linearly, so each higher tier costs disproportionately more
+// than the last, not just a flat multiple of tier 1.
 export const INGREDIENT_RESEARCH_COST_PER_TIER = 200;
 export function ingredientResearchCost(targetTier: number): number {
-  return targetTier * INGREDIENT_RESEARCH_COST_PER_TIER;
+  return INGREDIENT_RESEARCH_COST_PER_TIER * 2 ** (targetTier - 1);
 }
 
 // Banking, per doc §6.9 "reduced to a single loan action": one unsecured
@@ -79,7 +81,16 @@ export function grantDiscoveryLicense(
   if (licenses.some((l) => l.resourceId === resourceId)) return licenses;
   if (licenses.length >= licenseSlots) return licenses;
   const def = licenseDefById(scenario, resourceId);
-  return [...licenses, { resourceId, status: 'active', turnsUntilRenewal: def.renewalPeriod, unitsProducedThisPeriod: 0 }];
+  return [
+    ...licenses,
+    {
+      resourceId,
+      status: 'active',
+      turnsUntilRenewal: def.renewalPeriod,
+      unitsProducedThisPeriod: 0,
+      turnsUntilQuotaCheck: def.quotaPeriodTurns,
+    },
+  ];
 }
 
 function assetValue(player: CompanyState, scenario: ScenarioConfig): number {
@@ -203,13 +214,24 @@ function runUpkeep(state: GameState, scenario: ScenarioConfig) {
           lic.status = 'active';
           lic.suspendedTurnsLeft = undefined;
         }
-        if (def.quotaPeriodTurns) {
-          if (lic.unitsProducedThisPeriod < (def.quotaPerPeriod ?? 0)) {
-            lic.status = 'lapsed';
-            addLedger(state.ledger, state.turn, `Quota missed — license lapsed: ${lic.resourceId}`, 0, player.cash);
-          }
-          lic.unitsProducedThisPeriod = 0;
+      }
+    }
+
+    // Quota check runs on its OWN cadence (quotaPeriodTurns), independent of
+    // the renewal-fee cycle above — a license's quota window is usually
+    // longer than its renewal period, and tying the two together used to
+    // lapse every quota-gated license before a freshly-built facility could
+    // even finish construction, let alone produce anything.
+    if (lic.turnsUntilQuotaCheck !== undefined) {
+      lic.turnsUntilQuotaCheck -= 1;
+      if (lic.turnsUntilQuotaCheck <= 0) {
+        const def = licenseDefById(scenario, lic.resourceId);
+        if (lic.unitsProducedThisPeriod < (def.quotaPerPeriod ?? 0)) {
+          lic.status = 'lapsed';
+          addLedger(state.ledger, state.turn, `Quota missed — license lapsed: ${lic.resourceId}`, 0, player.cash);
         }
+        lic.unitsProducedThisPeriod = 0;
+        lic.turnsUntilQuotaCheck = def.quotaPeriodTurns;
       }
     }
   }
@@ -809,6 +831,7 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
           status: 'active',
           turnsUntilRenewal: def.renewalPeriod,
           unitsProducedThisPeriod: 0,
+          turnsUntilQuotaCheck: def.quotaPeriodTurns,
         });
         addLedger(state.ledger, state.turn, `Bought license: ${def.resourceId}`, -def.upfrontCost, player.cash);
       }

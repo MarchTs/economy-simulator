@@ -71,6 +71,10 @@ export interface HeldLicense {
   suspendedTurnsLeft?: number;
   turnsUntilRenewal: number;
   unitsProducedThisPeriod: number;
+  // Independent from turnsUntilRenewal — a quota-gated license's production
+  // window (LicenseDef.quotaPeriodTurns) is its own cadence, not tied to the
+  // renewal fee cycle. Undefined for licenses with no quota.
+  turnsUntilQuotaCheck?: number;
 }
 
 export interface Facility {

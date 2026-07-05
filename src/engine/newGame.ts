@@ -29,6 +29,7 @@ function makeStartingLicense(scenario: ScenarioConfig): HeldLicense {
     status: 'active',
     turnsUntilRenewal: def.renewalPeriod,
     unitsProducedThisPeriod: 0,
+    turnsUntilQuotaCheck: def.quotaPeriodTurns,
   };
 }
 

@@ -9,6 +9,7 @@ const resources: Resource[] = [
   { id: 'rice', name: 'Rice', tier: 0, basePrice: 3, facility: 'farm' },
   { id: 'wheat', name: 'Wheat', tier: 0, basePrice: 3, facility: 'farm' },
   { id: 'apple', name: 'Apple', tier: 0, basePrice: 5, facility: 'farm' },
+  { id: 'grape', name: 'Grape', tier: 0, basePrice: 7, facility: 'farm' },
   { id: 'silica_sand', name: 'Silica Sand', tier: 0, basePrice: 3, facility: 'quarry' },
   { id: 'aluminum_ore', name: 'Aluminum Ore', tier: 0, basePrice: 6, facility: 'quarry' },
 
@@ -40,6 +41,13 @@ const resources: Resource[] = [
     basePrice: 60,
     facility: 'brewery',
   },
+  {
+    id: 'wine',
+    name: 'Wine',
+    tier: 2,
+    basePrice: 85,
+    facility: 'brewery',
+  },
 
   {
     id: 'bottled_beer',
@@ -65,6 +73,22 @@ const resources: Resource[] = [
     facility: 'packaging_plant',
     shelfLifeTurns: 12,
   },
+  {
+    id: 'bottled_wine',
+    name: 'Bottled Wine',
+    tier: 3,
+    basePrice: 170,
+    facility: 'packaging_plant',
+    shelfLifeTurns: 12,
+  },
+  {
+    id: 'vodka',
+    name: 'Vodka',
+    tier: 3,
+    basePrice: 220,
+    facility: 'distillery',
+    shelfLifeTurns: 24, // distilled spirits keep far longer than beer/wine/cider
+  },
 ];
 
 // Tier-0 "extraction recipes": no inputs, unlocked by research/discovery.
@@ -75,6 +99,7 @@ const extractionRecipes: Recipe[] = [
   { id: 'recipe_extract_rice', output: 'rice', outputQty: 1, facility: 'farm', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_wheat', output: 'wheat', outputQty: 1, facility: 'farm', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_apple', output: 'apple', outputQty: 1, facility: 'farm', inputs: [], published: false, communityLevel: 0 },
+  { id: 'recipe_extract_grape', output: 'grape', outputQty: 1, facility: 'farm', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_silica_sand', output: 'silica_sand', outputQty: 1, facility: 'quarry', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_aluminum_ore', output: 'aluminum_ore', outputQty: 1, facility: 'quarry', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_yeast_culture', output: 'yeast_culture', outputQty: 1, facility: 'lab', inputs: [], published: false, communityLevel: 0 },
@@ -170,6 +195,18 @@ const recipes: Recipe[] = [
     communityLevel: 0,
   },
   {
+    id: 'recipe_wine',
+    output: 'wine',
+    outputQty: 1,
+    facility: 'brewery',
+    inputs: [
+      { ingredientId: 'grape', qty: 5 },
+      { ingredientId: 'yeast_culture', qty: 1 },
+    ],
+    published: false,
+    communityLevel: 0,
+  },
+  {
     id: 'recipe_bottled_beer',
     output: 'bottled_beer',
     outputQty: 1,
@@ -205,6 +242,30 @@ const recipes: Recipe[] = [
     published: false,
     communityLevel: 0,
   },
+  {
+    id: 'recipe_bottled_wine',
+    output: 'bottled_wine',
+    outputQty: 1,
+    facility: 'packaging_plant',
+    inputs: [
+      { ingredientId: 'wine', qty: 1 },
+      { ingredientId: 'glass_bottle', qty: 6 },
+    ],
+    published: false,
+    communityLevel: 0,
+  },
+  {
+    // Distillation: a genuinely different process from brewing/fermenting —
+    // its own facility type. Concentrates an already-fermented tier-2
+    // beverage into a high-proof spirit, rather than starting from raw grain.
+    id: 'recipe_vodka',
+    output: 'vodka',
+    outputQty: 1,
+    facility: 'distillery',
+    inputs: [{ ingredientId: 'wine', qty: 2 }],
+    published: false,
+    communityLevel: 0,
+  },
 ];
 
 const licenses: LicenseDef[] = [
@@ -213,6 +274,7 @@ const licenses: LicenseDef[] = [
   { resourceId: 'rice', class: 'open', upfrontCost: 40, renewalCost: 8, renewalPeriod: 5, minReputation: 0 },
   { resourceId: 'wheat', class: 'open', upfrontCost: 40, renewalCost: 8, renewalPeriod: 5, minReputation: 0 },
   { resourceId: 'apple', class: 'open', upfrontCost: 45, renewalCost: 9, renewalPeriod: 5, minReputation: 0 },
+  { resourceId: 'grape', class: 'open', upfrontCost: 50, renewalCost: 10, renewalPeriod: 5, minReputation: 0 },
   { resourceId: 'silica_sand', class: 'open', upfrontCost: 40, renewalCost: 8, renewalPeriod: 5, minReputation: 0 },
   { resourceId: 'aluminum_ore', class: 'open', upfrontCost: 55, renewalCost: 11, renewalPeriod: 5, minReputation: 0 },
 
@@ -262,9 +324,21 @@ const licenses: LicenseDef[] = [
     quotaPerPeriod: 15,
     quotaPeriodTurns: 10,
   },
+  {
+    resourceId: 'wine',
+    class: 'closed',
+    upfrontCost: 3500,
+    renewalCost: 300,
+    renewalPeriod: 5,
+    minReputation: 35,
+    quotaPerPeriod: 15,
+    quotaPeriodTurns: 10,
+  },
   { resourceId: 'bottled_beer', class: 'closed', upfrontCost: 800, renewalCost: 100, renewalPeriod: 5, minReputation: 30 },
   { resourceId: 'canned_beer', class: 'closed', upfrontCost: 800, renewalCost: 100, renewalPeriod: 5, minReputation: 30 },
   { resourceId: 'bottled_cider', class: 'closed', upfrontCost: 700, renewalCost: 90, renewalPeriod: 5, minReputation: 25 },
+  { resourceId: 'bottled_wine', class: 'closed', upfrontCost: 850, renewalCost: 110, renewalPeriod: 5, minReputation: 30 },
+  { resourceId: 'vodka', class: 'closed', upfrontCost: 1200, renewalCost: 150, renewalPeriod: 5, minReputation: 40 },
 ];
 
 const facilityTypes: FacilityTypeDef[] = [
@@ -276,6 +350,7 @@ const facilityTypes: FacilityTypeDef[] = [
   { type: 'can_plant', buildCost: 900, buildTurns: 3, baseCapacity: 15, upkeepPerTurn: 10, workersForFullCapacity: 3, standardWage: 12 },
   { type: 'brewery', buildCost: 5000, buildTurns: 6, baseCapacity: 10, upkeepPerTurn: 50, workersForFullCapacity: 6, standardWage: 20 },
   { type: 'packaging_plant', buildCost: 1500, buildTurns: 4, baseCapacity: 12, upkeepPerTurn: 20, workersForFullCapacity: 4, standardWage: 15 },
+  { type: 'distillery', buildCost: 2000, buildTurns: 5, baseCapacity: 10, upkeepPerTurn: 25, workersForFullCapacity: 5, standardWage: 16 },
 ];
 
 export const breweryScenario: ScenarioConfig = {

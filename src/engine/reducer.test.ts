@@ -439,13 +439,22 @@ describe('applyCommand — research ladder', () => {
     expect(ingredientResearchCost(1)).toBe(200);
   });
 
-  it('ingredient-directed research cost scales with the targeted tier', () => {
+  it('ingredient-directed research cost scales with the targeted tier, with tier 3 as a premium jump', () => {
     let state = newGame(breweryScenario, 6);
     state.player.cash = 10000;
     const cashBefore = state.player.cash;
     state = applyCommand(state, { kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 3 }, breweryScenario);
-    expect(state.player.cash).toBe(cashBefore - 600);
+    expect(state.player.cash).toBe(cashBefore - 800);
+    expect(ingredientResearchCost(3)).toBe(800);
     expect(state.player.knowledge.activeCommission?.targetTier).toBe(3);
+  });
+
+  it('ingredient-directed research cost doubles each tier, so tier 4/5 cost strictly more than tier 3', () => {
+    expect(ingredientResearchCost(1)).toBe(200);
+    expect(ingredientResearchCost(2)).toBe(400);
+    expect(ingredientResearchCost(3)).toBe(800);
+    expect(ingredientResearchCost(4)).toBe(1600);
+    expect(ingredientResearchCost(5)).toBe(3200);
   });
 
   it('cannot start research without enough cash', () => {
@@ -1020,6 +1029,62 @@ describe('bank loan', () => {
     const next = applyCommand(state, { kind: 'payLoanNow', loanId: loan.id }, breweryScenario);
     expect(next.player.loans).toHaveLength(0);
     expect(next.player.cash).toBe(cashBefore - 5);
+  });
+});
+
+describe('quota check runs on its own cadence, independent of the renewal cycle', () => {
+  // Regression coverage for a real bug found while adding Vodka: the quota
+  // check used to fire at every renewal (renewalPeriod, typically 5 turns),
+  // but quotaPeriodTurns is typically 10 — and facilities routinely take
+  // 6-7+ turns just to finish building. Every quota-gated license (keg_beer,
+  // wine, hard_cider, vodka, ...) lapsed before it could ever produce
+  // anything. Fixed via HeldLicense.turnsUntilQuotaCheck, ticked down
+  // separately from turnsUntilRenewal.
+
+  it('does not lapse a quota-gated license at its first renewal, before the quota period has elapsed', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.cash = 1_000_000;
+    state.player.licenseSlots = 10;
+    state = applyCommand(state, { kind: 'buyLicense', resourceId: 'keg_beer' }, breweryScenario);
+    const def = breweryScenario.licenses.find((l) => l.resourceId === 'keg_beer')!;
+    expect(def.renewalPeriod).toBeLessThan(def.quotaPeriodTurns!); // the exact mismatch that caused the bug
+
+    for (let i = 0; i < def.renewalPeriod; i++) state = tick(state, breweryScenario);
+    // Past the first renewal, with zero keg_beer produced — the license must
+    // still be alive (quota window hasn't elapsed yet), just renewed.
+    const lic = state.player.licenses.find((l) => l.resourceId === 'keg_beer');
+    expect(lic).toBeDefined();
+    expect(lic!.status).toBe('active');
+  });
+
+  it('does lapse a quota-gated license once its own quota period elapses with the quota unmet', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.cash = 1_000_000;
+    state.player.licenseSlots = 10;
+    state = applyCommand(state, { kind: 'buyLicense', resourceId: 'keg_beer' }, breweryScenario);
+    const def = breweryScenario.licenses.find((l) => l.resourceId === 'keg_beer')!;
+
+    for (let i = 0; i < def.quotaPeriodTurns!; i++) state = tick(state, breweryScenario);
+    // No keg_beer was ever produced — the quota window has now fully elapsed.
+    expect(state.player.licenses.some((l) => l.resourceId === 'keg_beer')).toBe(false);
+    const lapseEntry = state.ledger.filter((e) => e.label.includes('Quota missed'));
+    expect(lapseEntry.length).toBeGreaterThan(0);
+  });
+
+  it('resets unitsProducedThisPeriod and the quota countdown independently of the renewal countdown', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.cash = 1_000_000;
+    state.player.licenseSlots = 10;
+    state = applyCommand(state, { kind: 'buyLicense', resourceId: 'keg_beer' }, breweryScenario);
+    const def = breweryScenario.licenses.find((l) => l.resourceId === 'keg_beer')!;
+    let lic = state.player.licenses.find((l) => l.resourceId === 'keg_beer')!;
+    lic.unitsProducedThisPeriod = def.quotaPerPeriod!; // pretend quota was already met
+
+    for (let i = 0; i < def.quotaPeriodTurns!; i++) state = tick(state, breweryScenario);
+    lic = state.player.licenses.find((l) => l.resourceId === 'keg_beer')!;
+    expect(lic.status).toBe('active'); // quota met, no lapse
+    expect(lic.unitsProducedThisPeriod).toBe(0); // reset for the next window
+    expect(lic.turnsUntilQuotaCheck).toBe(def.quotaPeriodTurns); // countdown restarted
   });
 });
 
