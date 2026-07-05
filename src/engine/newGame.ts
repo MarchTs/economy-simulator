@@ -17,6 +17,7 @@ function makeStartingFacility(scenario: ScenarioConfig): Facility {
     condition: 100,
     maintenanceFunded: true,
     capacityUsedThisTick: 0,
+    upkeepPrepaid: false,
   };
 }
 

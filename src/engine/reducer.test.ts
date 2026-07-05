@@ -222,7 +222,7 @@ describe('applyCommand — production & licensing', () => {
     state.player.licenses.push({ resourceId: 'malt', status: 'active', turnsUntilRenewal: 5, unitsProducedThisPeriod: 0 });
     state.player.facilities.push({
       id: 'facility_malt', type: 'malthouse', assignedResourceId: 'malt', capacityPerTurn: 15, level: 1, buildTurnsLeft: 0, upkeepPerTurn: 10,
-      requiredWorkers: 3, hiredWorkers: 3, wageRatio: 1.0, condition: 100, maintenanceFunded: true, capacityUsedThisTick: 0,
+      requiredWorkers: 3, hiredWorkers: 3, wageRatio: 1.0, condition: 100, maintenanceFunded: true, capacityUsedThisTick: 0, upkeepPrepaid: false,
     });
     state = applyCommand(state, { kind: 'toggleAutoProduce', resourceId: 'malt', on: true }, breweryScenario);
     state = tick(state, breweryScenario); // no barley in inventory → no malt
@@ -624,6 +624,151 @@ describe('bank loan', () => {
     state.player.cash = 10_000; // plenty to cover every payment on time
     for (let i = 0; i < LOAN_TERM_TURNS; i++) state = tick(state, breweryScenario);
     expect(state.player.loans).toHaveLength(0);
+  });
+
+  it('payLoanNow deducts exactly one installment and lowers the remaining balance', () => {
+    let state = newGame(breweryScenario, 5);
+    state = applyCommand(state, { kind: 'takeLoan', amount: 500 }, breweryScenario);
+    const loan = state.player.loans[0];
+    const cashBefore = state.player.cash;
+
+    state = applyCommand(state, { kind: 'payLoanNow', loanId: loan.id }, breweryScenario);
+    expect(state.player.cash).toBe(cashBefore - loan.paymentPerTurn);
+    expect(state.player.loans[0].remaining).toBeCloseTo(loan.remaining - loan.paymentPerTurn, 5);
+  });
+
+  it('paying one installment early does not cause an extra charge overall — it just shifts the timing', () => {
+    // Path A: pay one installment manually, then let one tick run.
+    let pathA = newGame(breweryScenario, 5);
+    pathA = applyCommand(pathA, { kind: 'takeLoan', amount: 500 }, breweryScenario);
+    pathA = applyCommand(pathA, { kind: 'payLoanNow', loanId: pathA.player.loans[0].id }, breweryScenario);
+    pathA = tick(pathA, breweryScenario);
+
+    // Path B: let two ticks run automatically, no manual payment at all.
+    let pathB = newGame(breweryScenario, 5);
+    pathB = applyCommand(pathB, { kind: 'takeLoan', amount: 500 }, breweryScenario);
+    pathB = tick(pathB, breweryScenario);
+    pathB = tick(pathB, breweryScenario);
+
+    // Same two installments' worth paid down in both paths — no double charge.
+    expect(pathA.player.loans[0]?.remaining ?? 0).toBeCloseTo(pathB.player.loans[0]?.remaining ?? 0, 5);
+  });
+
+  it('payLoanNow does nothing if cash is insufficient', () => {
+    let state = newGame(breweryScenario, 5);
+    state = applyCommand(state, { kind: 'takeLoan', amount: 500 }, breweryScenario);
+    const loan = state.player.loans[0];
+    state.player.cash = 0;
+    const next = applyCommand(state, { kind: 'payLoanNow', loanId: loan.id }, breweryScenario);
+    expect(next.player.loans[0].remaining).toBe(loan.remaining); // unchanged
+  });
+
+  it('payLoanNow pays off and removes a loan whose remaining is less than one installment', () => {
+    let state = newGame(breweryScenario, 5);
+    state = applyCommand(state, { kind: 'takeLoan', amount: 500 }, breweryScenario);
+    const loan = state.player.loans[0];
+    state.player.loans[0].remaining = 5; // less than paymentPerTurn
+    const cashBefore = state.player.cash;
+    const next = applyCommand(state, { kind: 'payLoanNow', loanId: loan.id }, breweryScenario);
+    expect(next.player.loans).toHaveLength(0);
+    expect(next.player.cash).toBe(cashBefore - 5);
+  });
+});
+
+describe('renewLicenseNow', () => {
+  it('pays the renewal fee immediately and resets the countdown to a full period', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.licenses[0].turnsUntilRenewal = 1; // about to renew naturally
+    const def = breweryScenario.licenses.find((l) => l.resourceId === 'barley')!;
+    const cashBefore = state.player.cash;
+
+    state = applyCommand(state, { kind: 'renewLicenseNow', resourceId: 'barley' }, breweryScenario);
+    expect(state.player.cash).toBe(cashBefore - def.renewalCost);
+    expect(state.player.licenses[0].turnsUntilRenewal).toBe(def.renewalPeriod);
+  });
+
+  it('does not renew (or charge) a license the player does not hold', () => {
+    const state = newGame(breweryScenario, 5);
+    const cashBefore = state.player.cash;
+    const next = applyCommand(state, { kind: 'renewLicenseNow', resourceId: 'hops' }, breweryScenario);
+    expect(next.player.cash).toBe(cashBefore);
+  });
+
+  it('does nothing if cash is insufficient', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.cash = 0;
+    const next = applyCommand(state, { kind: 'renewLicenseNow', resourceId: 'barley' }, breweryScenario);
+    expect(next.player.licenses[0].turnsUntilRenewal).toBe(state.player.licenses[0].turnsUntilRenewal);
+  });
+
+  it('an early renewal prevents the automatic renewal from double-charging', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.licenses[0].turnsUntilRenewal = 1; // would renew on the very next tick otherwise
+    state = applyCommand(state, { kind: 'renewLicenseNow', resourceId: 'barley' }, breweryScenario);
+
+    const next = tick(state, breweryScenario);
+    // The countdown was reset to a full period, so this tick should NOT also
+    // charge a renewal fee — only ordinary upkeep/payroll should apply.
+    const renewalLedgerEntries = next.ledger.filter((e) => e.label.includes('License renewal'));
+    expect(renewalLedgerEntries).toHaveLength(0);
+    expect(next.player.licenses[0].turnsUntilRenewal).toBeLessThan(state.player.licenses[0].turnsUntilRenewal);
+  });
+});
+
+describe('payFacilityUpkeepNow', () => {
+  it('charges upkeep+payroll immediately and marks the facility prepaid', () => {
+    let state = newGame(breweryScenario, 5);
+    const facility = state.player.facilities[0];
+    const def = breweryScenario.facilityTypes.find((f) => f.type === facility.type)!;
+    const expectedTotal = facility.upkeepPerTurn + def.standardWage * facility.wageRatio * facility.hiredWorkers;
+    const cashBefore = state.player.cash;
+
+    state = applyCommand(state, { kind: 'payFacilityUpkeepNow', facilityId: facility.id }, breweryScenario);
+    expect(state.player.cash).toBeCloseTo(cashBefore - expectedTotal, 5);
+    expect(state.player.facilities[0].upkeepPrepaid).toBe(true);
+  });
+
+  it('does nothing if cash is insufficient', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.cash = 0;
+    const facility = state.player.facilities[0];
+    state = applyCommand(state, { kind: 'payFacilityUpkeepNow', facilityId: facility.id }, breweryScenario);
+    expect(state.player.facilities[0].upkeepPrepaid).toBe(false);
+  });
+
+  it('does nothing for a facility still under construction', () => {
+    let state = newGame(breweryScenario, 5);
+    state = applyCommand(state, { kind: 'buildFacility', facilityType: 'quarry', resourceId: 'silica_sand' }, breweryScenario);
+    const quarry = state.player.facilities.find((f) => f.type === 'quarry')!;
+    const cashBefore = state.player.cash;
+    state = applyCommand(state, { kind: 'payFacilityUpkeepNow', facilityId: quarry.id }, breweryScenario);
+    expect(state.player.cash).toBe(cashBefore);
+    expect(state.player.facilities.find((f) => f.id === quarry.id)!.upkeepPrepaid).toBe(false);
+  });
+
+  it('paying upkeep early does not cause an extra charge overall — it just shifts the timing', () => {
+    let pathA = newGame(breweryScenario, 5);
+    const facilityA = pathA.player.facilities[0];
+    pathA = applyCommand(pathA, { kind: 'payFacilityUpkeepNow', facilityId: facilityA.id }, breweryScenario);
+    pathA = tick(pathA, breweryScenario);
+
+    let pathB = newGame(breweryScenario, 5);
+    pathB = tick(pathB, breweryScenario);
+
+    expect(pathA.player.cash).toBeCloseTo(pathB.player.cash, 5);
+  });
+
+  it('an already-prepaid facility is not charged again by the automatic upkeep, and the flag resets', () => {
+    let state = newGame(breweryScenario, 5);
+    const facility = state.player.facilities[0];
+    state = applyCommand(state, { kind: 'payFacilityUpkeepNow', facilityId: facility.id }, breweryScenario);
+    const cashAfterPrepay = state.player.cash;
+
+    const next = tick(state, breweryScenario);
+    const upkeepLedgerEntries = next.ledger.filter((e) => e.label.includes('Upkeep+payroll'));
+    expect(upkeepLedgerEntries).toHaveLength(0);
+    expect(next.player.facilities[0].upkeepPrepaid).toBe(false);
+    expect(next.player.cash).toBeCloseTo(cashAfterPrepay, 5); // no other charges apply this simple tick
   });
 });
 

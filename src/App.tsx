@@ -685,7 +685,7 @@ function App() {
 
                 <h3 className="sub">Facility upkeep &amp; payroll</h3>
                 <table>
-                  <thead><tr><th>Facility</th><th className="num">Upkeep</th><th className="num">Payroll</th><th className="num">Total</th></tr></thead>
+                  <thead><tr><th>Facility</th><th className="num">Upkeep</th><th className="num">Payroll</th><th className="num">Total</th><th></th></tr></thead>
                   <tbody>
                     {bills.facilities.map((f) => (
                       <tr key={f.facilityId}>
@@ -693,9 +693,19 @@ function App() {
                         <td className="num">{Math.round(f.upkeep)}g</td>
                         <td className="num">{Math.round(f.payroll)}g</td>
                         <td className="num">{Math.round(f.upkeep + f.payroll)}g</td>
+                        <td>
+                          {f.prepaid ? (
+                            <span className="muted">Paid</span>
+                          ) : (
+                            <button disabled={state.player.cash < f.upkeep + f.payroll}
+                              onClick={() => cmd({ kind: 'payFacilityUpkeepNow', facilityId: f.facilityId })}>
+                              Pay now
+                            </button>
+                          )}
+                        </td>
                       </tr>
                     ))}
-                    {bills.facilities.length === 0 && <tr><td colSpan={4} className="muted">No operational facilities.</td></tr>}
+                    {bills.facilities.length === 0 && <tr><td colSpan={5} className="muted">No operational facilities.</td></tr>}
                   </tbody>
                 </table>
 
@@ -710,12 +720,24 @@ function App() {
 
                 <h3 className="sub">Loan payments</h3>
                 <table>
-                  <thead><tr><th className="num">Payment</th></tr></thead>
+                  <thead><tr><th className="num">Payment</th><th className="num">Remaining</th><th></th></tr></thead>
                   <tbody>
-                    {bills.loanPayments.map((l) => (
-                      <tr key={l.loanId}><td className="num">{Math.round(l.payment)}g</td></tr>
-                    ))}
-                    {bills.loanPayments.length === 0 && <tr><td className="muted">No active loans.</td></tr>}
+                    {state.player.loans.map((l) => {
+                      const payment = Math.min(l.paymentPerTurn, l.remaining);
+                      return (
+                        <tr key={l.id}>
+                          <td className="num">{Math.round(payment)}g</td>
+                          <td className="num">{Math.round(l.remaining)}g</td>
+                          <td>
+                            <button disabled={state.player.cash < payment}
+                              onClick={() => cmd({ kind: 'payLoanNow', loanId: l.id })}>
+                              Pay now
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {state.player.loans.length === 0 && <tr><td colSpan={3} className="muted">No active loans.</td></tr>}
                   </tbody>
                 </table>
 
@@ -735,19 +757,30 @@ function App() {
 
                 <h3 className="sub">Upcoming license renewals</h3>
                 <table>
-                  <thead><tr><th>Resource</th><th className="num">Cost</th><th className="num">Due in</th></tr></thead>
+                  <thead><tr><th>Resource</th><th className="num">Cost</th><th className="num">Due in</th><th></th></tr></thead>
                   <tbody>
                     {bills.licenseRenewals.map((l) => (
                       <tr key={l.resourceId}>
                         <td className="resource-name">{resourceName(l.resourceId)}</td>
                         <td className="num">{l.cost}g</td>
                         <td className="num">{l.turnsUntilRenewal} turns</td>
+                        <td>
+                          <button disabled={state.player.cash < l.cost}
+                            onClick={() => cmd({ kind: 'renewLicenseNow', resourceId: l.resourceId })}>
+                            Renew now
+                          </button>
+                        </td>
                       </tr>
                     ))}
-                    {bills.licenseRenewals.length === 0 && <tr><td colSpan={3} className="muted">No licenses held.</td></tr>}
+                    {bills.licenseRenewals.length === 0 && <tr><td colSpan={4} className="muted">No licenses held.</td></tr>}
                   </tbody>
                 </table>
-                <p className="hint">Renewals are periodic, not charged every turn — not included in the "due next turn" total above.</p>
+                <p className="hint">
+                  Renewals are periodic (not charged every turn) — renewing early just resets the countdown, it doesn't discount the fee.
+                  Facility upkeep/payroll can be paid a turn ahead — it just settles this turn's charge early, so the automatic
+                  deduction is skipped once. Defenses and buy contracts still don't have a "pay now" — they're recalculated fresh
+                  each turn with no balance to pay ahead of.
+                </p>
               </>
             )}
 

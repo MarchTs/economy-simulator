@@ -87,6 +87,7 @@ export interface Facility {
   condition: number; // 100 = perfect, degrades if unmaintained (higher level = slower degrade)
   maintenanceFunded: boolean;
   capacityUsedThisTick: number; // resets each tick; caps real-time production
+  upkeepPrepaid: boolean; // true if this turn's upkeep+payroll was already paid early; runUpkeep skips the charge and resets it
 }
 
 export interface InventoryEntry {

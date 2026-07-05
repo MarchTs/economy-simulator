@@ -75,7 +75,7 @@ export function loanCreditLimit(player: CompanyState, scenario: ScenarioConfig):
 }
 
 export interface BillsBreakdown {
-  facilities: { facilityId: FacilityId; type: string; upkeep: number; payroll: number }[];
+  facilities: { facilityId: FacilityId; type: string; upkeep: number; payroll: number; prepaid: boolean }[];
   insurance: number;
   legalRetainer: number;
   loanPayments: { loanId: string; payment: number }[];
@@ -99,8 +99,9 @@ export function estimateBills(state: GameState, scenario: ScenarioConfig): Bills
       return {
         facilityId: f.id,
         type: f.type,
-        upkeep: f.upkeepPerTurn * costMult,
-        payroll: def.standardWage * f.wageRatio * f.hiredWorkers,
+        upkeep: f.upkeepPrepaid ? 0 : f.upkeepPerTurn * costMult,
+        payroll: f.upkeepPrepaid ? 0 : def.standardWage * f.wageRatio * f.hiredWorkers,
+        prepaid: f.upkeepPrepaid,
       };
     });
 
@@ -168,12 +169,16 @@ function runUpkeep(state: GameState, scenario: ScenarioConfig) {
   const costMult = costMultiplierNow(state);
   for (const f of player.facilities) {
     if (f.buildTurnsLeft > 0) continue;
-    const def = facilityTypeDef(scenario, f.type);
-    const upkeep = f.upkeepPerTurn * costMult;
-    player.cash -= upkeep;
-    const wage = def.standardWage * f.wageRatio * f.hiredWorkers;
-    player.cash -= wage;
-    addLedger(state.ledger, state.turn, `Upkeep+payroll: ${f.type}`, -(upkeep + wage), player.cash);
+    if (f.upkeepPrepaid) {
+      f.upkeepPrepaid = false;
+    } else {
+      const def = facilityTypeDef(scenario, f.type);
+      const upkeep = f.upkeepPerTurn * costMult;
+      player.cash -= upkeep;
+      const wage = def.standardWage * f.wageRatio * f.hiredWorkers;
+      player.cash -= wage;
+      addLedger(state.ledger, state.turn, `Upkeep+payroll: ${f.type}`, -(upkeep + wage), player.cash);
+    }
     if (!f.maintenanceFunded) {
       // Higher levels resist wear better — degradation shrinks per level, floored at 1/min.
       const degrade = Math.max(1, 5 - (f.level - 1));
@@ -623,7 +628,10 @@ export type Command =
   | { kind: 'lawsuitDecision'; decision: 'settle' | 'fight' }
   | { kind: 'resolveDisclosure'; choice: 'free' | 'exclusive' | 'sell' }
   | { kind: 'takeLoan'; amount: number }
-  | { kind: 'repayLoanEarly'; loanId: string };
+  | { kind: 'repayLoanEarly'; loanId: string }
+  | { kind: 'payLoanNow'; loanId: string }
+  | { kind: 'renewLicenseNow'; resourceId: ResourceId }
+  | { kind: 'payFacilityUpkeepNow'; facilityId: FacilityId };
 
 export function applyCommand(prevState: GameState, cmd: Command, scenario: ScenarioConfig): GameState {
   const state = clone(prevState);
@@ -718,6 +726,7 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
           condition: 100,
           maintenanceFunded: true,
           capacityUsedThisTick: 0,
+          upkeepPrepaid: false,
         };
         player.facilities.push(newFacility);
         addLedger(state.ledger, state.turn, `Built facility: ${def.type} → ${cmd.resourceId}`, -def.buildCost, player.cash);
@@ -910,6 +919,62 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
         const [loan] = player.loans.splice(idx, 1);
         player.cash -= loan.remaining;
         addLedger(state.ledger, state.turn, 'Repaid loan early', -loan.remaining, player.cash);
+      }
+      break;
+    }
+
+    // Pays exactly one scheduled installment right now instead of waiting for
+    // the automatic end-of-turn deduction. Safe with no extra bookkeeping —
+    // it just lowers `remaining`, so the automatic payment charges less (or
+    // nothing) once the turn actually ends.
+    case 'payLoanNow': {
+      const loan = player.loans.find((l) => l.id === cmd.loanId);
+      if (loan) {
+        const payment = Math.min(loan.paymentPerTurn, loan.remaining);
+        if (payment > 0 && player.cash >= payment) {
+          player.cash -= payment;
+          loan.remaining -= payment;
+          addLedger(state.ledger, state.turn, 'Paid loan installment early', -payment, player.cash);
+          if (loan.remaining <= 0) {
+            player.loans = player.loans.filter((l) => l.id !== loan.id);
+          }
+        }
+      }
+      break;
+    }
+
+    // Pays the renewal fee immediately and resets the countdown to a full
+    // period — an early renewal, not a discount. Safe: it just moves the
+    // same charge earlier, so the automatic renewal in runUpkeep won't
+    // double-charge (the countdown starts fresh from here).
+    case 'renewLicenseNow': {
+      const license = player.licenses.find((l) => l.resourceId === cmd.resourceId);
+      if (license) {
+        const def = licenseDefById(scenario, cmd.resourceId);
+        if (player.cash >= def.renewalCost) {
+          player.cash -= def.renewalCost;
+          license.turnsUntilRenewal = def.renewalPeriod;
+          addLedger(state.ledger, state.turn, `Renewed early: ${cmd.resourceId}`, -def.renewalCost, player.cash);
+        }
+      }
+      break;
+    }
+
+    // Pays this turn's upkeep+payroll right now and marks the facility so
+    // runUpkeep skips its automatic charge (and clears the flag) at turn's
+    // end — same anti-double-charge pattern as payLoanNow/renewLicenseNow.
+    case 'payFacilityUpkeepNow': {
+      const facility = player.facilities.find((f) => f.id === cmd.facilityId);
+      if (facility && facility.buildTurnsLeft === 0 && !facility.upkeepPrepaid) {
+        const def = facilityTypeDef(scenario, facility.type);
+        const upkeep = facility.upkeepPerTurn * costMultiplierNow(state);
+        const wage = def.standardWage * facility.wageRatio * facility.hiredWorkers;
+        const total = upkeep + wage;
+        if (player.cash >= total) {
+          player.cash -= total;
+          facility.upkeepPrepaid = true;
+          addLedger(state.ledger, state.turn, `Paid upkeep+payroll early: ${facility.type}`, -total, player.cash);
+        }
       }
       break;
     }
