@@ -8,6 +8,7 @@ import {
   effectiveCapacity,
   estimateBills,
   estimateRecipeSalePrice,
+  ingredientResearchCost,
   levelUpCost,
   levelUpDuration,
   loanCreditLimit,
@@ -18,11 +19,16 @@ import {
   type Command,
 } from './engine/reducer';
 import type { GameState, ResourceId } from './engine/types';
+import { bakeryScenario } from './scenarios/bakery/config';
 import { breweryScenario } from './scenarios/brewery/config';
+import type { ScenarioConfig } from './scenarios/types';
 import { MarketIntelView, type MarketIntel } from './ui/MarketIntelView';
 import { RecipeTreeView } from './ui/RecipeTreeView';
 
-const scenario = breweryScenario;
+const SCENARIOS: { config: ScenarioConfig; blurb: string }[] = [
+  { config: breweryScenario, blurb: 'License politics & production chains — barley to bottled beer. Higher capex, harder license gates.' },
+  { config: bakeryScenario, blurb: 'The tutorial track — cheap licenses, low capex, and the only scenario where unsold stock spoils.' },
+];
 const SEED = 1234;
 
 type Tab = 'licenses' | 'research' | 'facilities' | 'contracts' | 'bank' | 'payments' | 'defenses';
@@ -37,17 +43,41 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'defenses', label: 'Defenses' },
 ];
 
-function resourceName(id: ResourceId): string {
-  return scenario.resources.find((r) => r.id === id)?.name ?? id;
+function App() {
+  const [scenario, setScenario] = useState<ScenarioConfig | null>(null);
+
+  if (!scenario) {
+    return (
+      <div className="scenario-picker">
+        <h1>License Economy</h1>
+        <p className="muted">Choose a scenario to play.</p>
+        <div className="scenario-cards">
+          {SCENARIOS.map((s) => (
+            <button key={s.config.id} className="scenario-card" onClick={() => setScenario(s.config)}>
+              <h2>{s.config.name}</h2>
+              <p>{s.blurb}</p>
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return <Game key={scenario.id} scenario={scenario} onExit={() => setScenario(null)} />;
 }
 
-function App() {
+function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => void }) {
+  function resourceName(id: ResourceId): string {
+    return scenario.resources.find((r) => r.id === id)?.name ?? id;
+  }
+
   const [state, setState] = useState<GameState>(() => newGame(scenario, SEED));
   const [tab, setTab] = useState<Tab>('licenses');
   const [treeResource, setTreeResource] = useState<ResourceId | null>(null);
   const [intelResource, setIntelResource] = useState<ResourceId | null>(null);
   const [showAllMarket, setShowAllMarket] = useState(false);
   const [researchPick, setResearchPick] = useState<ResourceId[]>([]);
+  const [targetTier, setTargetTier] = useState(1);
   const [supplyForm, setSupplyForm] = useState({
     side: 'sell' as 'sell' | 'buy',
     resourceId: scenario.resources[0].id,
@@ -56,8 +86,14 @@ function App() {
     turnsLeft: 5,
   });
   const [buildForm, setBuildForm] = useState(() => {
-    const facilityType = scenario.facilityTypes[0].type;
-    const resourceId = scenario.resources.find((r) => r.facility === facilityType)!.id;
+    const isDiscoveredAtStart = makeDiscoveryChecker(state);
+    const facilityType =
+      scenario.facilityTypes.find((f) => scenario.resources.some((r) => r.facility === f.type && isDiscoveredAtStart(r.id)))?.type ??
+      scenario.facilityTypes[0].type;
+    const resourceId = (
+      scenario.resources.find((r) => r.facility === facilityType && isDiscoveredAtStart(r.id)) ??
+      scenario.resources.find((r) => r.facility === facilityType)!
+    ).id;
     return { facilityType, resourceId };
   });
   const [borrowAmount, setBorrowAmount] = useState(500);
@@ -134,12 +170,18 @@ function App() {
     return { recipe, resource, salePrice: estimateRecipeSalePrice(resource), queueLength: state.pendingDisclosures.length };
   }, [state]);
 
+  const isDiscovered = useMemo(() => makeDiscoveryChecker(state), [state]);
+
   const visibleResources = useMemo(() => {
     if (showAllMarket) return scenario.resources;
-    const isDiscovered = makeDiscoveryChecker(state);
     return scenario.resources.filter((r) => isDiscovered(r.id));
-  }, [state, showAllMarket]);
+  }, [isDiscovered, showAllMarket]);
   const hiddenCount = scenario.resources.length - visibleResources.length;
+
+  const visibleLicenses = useMemo(() => {
+    return scenario.licenses.filter((def) => isDiscovered(def.resourceId));
+  }, [isDiscovered]);
+  const hiddenLicenseCount = scenario.licenses.length - visibleLicenses.length;
 
   const discoverableCount = useMemo(() => {
     const known = state.player.knowledge.knownRecipeIds;
@@ -152,12 +194,22 @@ function App() {
     return scenario.resources.filter((r) => state.recipes.some((rc) => rc.output === r.id && known.has(rc.id)));
   }, [state]);
 
+  const availableTiers = useMemo(() => {
+    return [...new Set(scenario.resources.filter((r) => r.tier > 0).map((r) => r.tier))].sort((a, b) => a - b);
+  }, [scenario]);
+
   const pickMatches = useMemo(() => {
     if (researchPick.length === 0) return 0;
     const known = state.player.knowledge.knownRecipeIds;
     const chosen = new Set(researchPick);
-    return state.recipes.filter((r) => !known.has(r.id) && r.inputs.length > 0 && r.inputs.every((i) => chosen.has(i.ingredientId))).length;
-  }, [researchPick, state]);
+    return state.recipes.filter(
+      (r) =>
+        !known.has(r.id) &&
+        r.inputs.length > 0 &&
+        r.inputs.every((i) => chosen.has(i.ingredientId)) &&
+        scenario.resources.find((res) => res.id === r.output)?.tier === targetTier
+    ).length;
+  }, [researchPick, targetTier, state]);
 
   // Instant action: apply a command immediately and re-render.
   function cmd(c: Command) {
@@ -175,6 +227,7 @@ function App() {
       <div className="game-over">
         <h1>{state.gameOver.result === 'won' ? 'You won!' : state.gameOver.result === 'bankrupt' ? 'Bankrupt.' : 'Run ended.'}</h1>
         <p className="muted">Ended at turn {state.gameOver.turn}. Final net worth: {netWorth}g</p>
+        <button onClick={onExit}>Choose a scenario</button>
       </div>
     );
   }
@@ -191,7 +244,7 @@ function App() {
       <header className="hud">
         <div className="title">
           License Economy
-          <small>Brewery · Turn {state.turn} / 60</small>
+          <small>{scenario.name.toUpperCase()} · Turn {state.turn} / 60</small>
         </div>
         <div className="stat"><span className="label">Cash</span><span className="value">{Math.round(state.player.cash)}g</span></div>
         <div className="stat"><span className="label">Net worth</span><span className="value">{netWorth}g</span></div>
@@ -203,11 +256,13 @@ function App() {
             <div key={e.id} className="effect-badge">{e.label} · {e.turnsLeft} turns</div>
           ))}
         </div>
+
+        <button className="exit-btn" onClick={onExit} title="Abandon this run and pick a different scenario">Switch scenario</button>
       </header>
 
       {state.pendingLawsuit && (
-        <div className="modal-overlay">
-          <div className="modal">
+        <div className="prompt-overlay">
+          <div className="prompt-card">
             <h3>⚖ {state.pendingLawsuit.label}</h3>
             <p className="muted">
               Settle for {state.pendingLawsuit.settleCost}g, or fight — {Math.round(state.pendingLawsuit.fightWinChance * 100)}% chance
@@ -223,8 +278,8 @@ function App() {
       )}
 
       {pendingDisclosure && (
-        <div className="modal-overlay">
-          <div className="modal">
+        <div className="prompt-overlay">
+          <div className="prompt-card">
             <h3>🔬 You discovered {pendingDisclosure.resource.name}!</h3>
             <p className="muted">
               Decide what happens to this recipe. Whatever you pick, you keep using it yourself either way.
@@ -263,7 +318,7 @@ function App() {
           <div className="panel-body">
             <table>
               <thead>
-                <tr><th>Resource</th><th className="num">Price</th><th className="num">Held</th><th className="num">Rate</th><th>Produce</th></tr>
+                <tr><th>Resource</th><th className="num">Price</th><th className="num">Held</th><th className="num">Rate</th></tr>
               </thead>
               <tbody>
                 {visibleResources.map((r) => {
@@ -284,22 +339,7 @@ function App() {
                       </td>
                       <td className="num">{entry.price.toFixed(1)}g{priceDelta(r.id, entry.price)}</td>
                       <td className="num">{state.player.inventory[r.id]?.qty ?? 0}</td>
-                      <td className="num">{licensed && known && facility ? `${perTurn}/turn` : '—'}</td>
-                      <td>
-                        {!licensed ? (
-                          <span className="muted">no license</span>
-                        ) : !known ? (
-                          <span className="muted">undiscovered</span>
-                        ) : !facility ? (
-                          <span className="hint">needs {r.facility}</span>
-                        ) : (
-                          <button
-                            className={on ? 'toggle-on' : 'toggle-off'}
-                            onClick={(e) => { e.stopPropagation(); cmd({ kind: 'toggleAutoProduce', resourceId: r.id, on: !on }); }}>
-                            {on ? '● On' : 'Enable'}
-                          </button>
-                        )}
-                      </td>
+                      <td className="num">{licensed && known && facility ? `${perTurn}/turn${on ? '' : ' (off)'}` : '—'}</td>
                     </tr>
                   );
                 })}
@@ -319,10 +359,16 @@ function App() {
           </div>
           <div className="panel-body">
             {tab === 'licenses' && (
-              <table>
+              <>
+                {hiddenLicenseCount > 0 && (
+                  <p className="hint" style={{ margin: '0 4px 8px' }}>
+                    {hiddenLicenseCount} undiscovered license{hiddenLicenseCount === 1 ? '' : 's'} hidden — discover the resource first (Research tab).
+                  </p>
+                )}
+                <table>
                 <thead><tr><th>Resource</th><th>Class</th><th className="num">Cost</th><th>Status</th><th></th></tr></thead>
                 <tbody>
-                  {scenario.licenses.map((def) => {
+                  {visibleLicenses.map((def) => {
                     const held = state.player.licenses.find((l) => l.resourceId === def.resourceId);
                     return (
                       <tr key={def.resourceId}>
@@ -344,7 +390,8 @@ function App() {
                     );
                   })}
                 </tbody>
-              </table>
+                </table>
+              </>
             )}
 
             {tab === 'research' && (
@@ -356,17 +403,20 @@ function App() {
                     : 'none'}
                 </p>
 
-                <h3 className="sub">Breakthrough (3 ticks)</h3>
+                <h3 className="sub">Breakthrough (3 ticks · {scenario.researchCost}g)</h3>
                 <p className="hint" style={{ margin: '0 4px 8px' }}>
                   A breakthrough finds a random recipe you can now reach — one whose ingredients you already know how to make.
                   {discoverableCount > 0 ? ` ${discoverableCount} within reach.` : ' Nothing new within reach — discover more ingredients first.'}
                 </p>
-                <button className="discover-btn" disabled={!!activeCommission || discoverableCount === 0} onClick={() => cmd({ kind: 'researchBlind' })}>
-                  🔬 Breakthrough
+                <button className="discover-btn" disabled={!!activeCommission || discoverableCount === 0 || state.player.cash < scenario.researchCost} onClick={() => cmd({ kind: 'researchBlind' })}>
+                  🔬 Breakthrough · {scenario.researchCost}g
                 </button>
 
-                <h3 className="sub">Or experiment with ingredients (3 ticks)</h3>
-                <p className="hint" style={{ margin: '0 4px 8px' }}>Pick ingredients you know how to make; research finds a recipe built from them.</p>
+                <h3 className="sub">Or experiment with ingredients (3 ticks · {ingredientResearchCost(targetTier)}g)</h3>
+                <p className="hint" style={{ margin: '0 4px 8px' }}>
+                  Pick ingredients you know how to make and a tier to aim for; research finds a recipe of that tier built from them.
+                  Costs more for higher tiers — you're paying for precision, not luck.
+                </p>
                 {knownResources.length === 0 ? (
                   <p className="muted" style={{ padding: '0 4px' }}>Discover an ingredient first (try a breakthrough).</p>
                 ) : (
@@ -379,15 +429,23 @@ function App() {
                         </button>
                       ))}
                     </div>
-                    <button className="discover-btn" disabled={!!activeCommission || researchPick.length === 0}
-                      onClick={() => { cmd({ kind: 'researchByIngredients', ingredients: [...researchPick] }); setResearchPick([]); }}>
-                      ⚗ Experiment with selection
+                    <div className="btn-row" style={{ marginTop: '6px' }}>
+                      {availableTiers.map((t) => (
+                        <button key={t} className={targetTier === t ? 'pick-chip selected' : 'pick-chip'}
+                          disabled={!!activeCommission} onClick={() => setTargetTier(t)}>
+                          {targetTier === t ? '✓ ' : ''}Tier {t} · {ingredientResearchCost(t)}g
+                        </button>
+                      ))}
+                    </div>
+                    <button className="discover-btn" disabled={!!activeCommission || researchPick.length === 0 || state.player.cash < ingredientResearchCost(targetTier)}
+                      onClick={() => { cmd({ kind: 'researchByIngredients', ingredients: [...researchPick], targetTier }); setResearchPick([]); }}>
+                      ⚗ Experiment with selection · {ingredientResearchCost(targetTier)}g
                     </button>
                     {researchPick.length > 0 && (
                       <p className="hint" style={{ margin: '6px 4px 0' }}>
                         {pickMatches > 0
-                          ? `${pickMatches} undiscovered recipe${pickMatches > 1 ? 's' : ''} can be built from this selection.`
-                          : 'No undiscovered recipe uses only these ingredients — add or change your picks.'}
+                          ? `${pickMatches} undiscovered tier-${targetTier} recipe${pickMatches > 1 ? 's' : ''} can be built from this selection.`
+                          : `No undiscovered tier-${targetTier} recipe uses only these ingredients — add or change your picks, or try a different tier.`}
                       </p>
                     )}
                   </>
@@ -405,16 +463,20 @@ function App() {
             {tab === 'facilities' && (
               <>
                 <table>
-                  <thead><tr><th>Type</th><th>Producing</th><th className="num">Level</th><th>Status</th><th className="num">Capacity</th><th>Workers</th><th></th></tr></thead>
+                  <thead><tr><th>Type</th><th>Producing</th><th>Output</th><th className="num">Level</th><th>Status</th><th className="num">Capacity</th><th>Workers</th><th></th></tr></thead>
                   <tbody>
                     {state.player.facilities.map((f) => {
                       const def = scenario.facilityTypes.find((ft) => ft.type === f.type)!;
-                      const options = scenario.resources.filter((r) => r.facility === f.type);
+                      const options = scenario.resources.filter((r) => r.facility === f.type && isDiscovered(r.id));
                       const upCost = levelUpCost(def, f.level);
                       const upDuration = levelUpDuration(def);
                       const atMax = f.level >= MAX_FACILITY_LEVEL;
                       const leveling = f.levelUpTurnsLeft !== undefined;
                       const building = f.buildTurnsLeft > 0;
+                      const licensed = state.player.licenses.some((l) => l.resourceId === f.assignedResourceId && l.status === 'active');
+                      const recipe = state.recipes.find((rec) => rec.output === f.assignedResourceId);
+                      const known = recipe !== undefined && state.player.knowledge.knownRecipeIds.has(recipe.id);
+                      const producing = state.player.autoProduce.includes(f.assignedResourceId);
                       return (
                         <tr key={f.id}>
                           <td className="resource-name">{f.type}</td>
@@ -423,6 +485,21 @@ function App() {
                               onChange={(e) => cmd({ kind: 'reassignFacility', facilityId: f.id, resourceId: e.target.value })}>
                               {options.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
                             </select>
+                          </td>
+                          <td>
+                            {building ? (
+                              <span className="muted">—</span>
+                            ) : !licensed ? (
+                              <span className="muted">no license</span>
+                            ) : !known ? (
+                              <span className="muted">undiscovered</span>
+                            ) : (
+                              <button
+                                className={producing ? 'toggle-on' : 'toggle-off'}
+                                onClick={() => cmd({ kind: 'toggleAutoProduce', resourceId: f.assignedResourceId, on: !producing })}>
+                                {producing ? '● On' : 'Enable'}
+                              </button>
+                            )}
                           </td>
                           <td className="num">L{f.level}</td>
                           <td className="muted">
@@ -456,17 +533,19 @@ function App() {
                       <select value={buildForm.facilityType}
                         onChange={(e) => {
                           const facilityType = e.target.value;
-                          const resourceId = scenario.resources.find((r) => r.facility === facilityType)!.id;
+                          const resourceId = scenario.resources.find((r) => r.facility === facilityType && isDiscovered(r.id))!.id;
                           setBuildForm({ facilityType, resourceId });
                         }}>
-                        {scenario.facilityTypes.map((f) => <option key={f.type} value={f.type}>{f.type}</option>)}
+                        {scenario.facilityTypes
+                          .filter((f) => scenario.resources.some((r) => r.facility === f.type && isDiscovered(r.id)))
+                          .map((f) => <option key={f.type} value={f.type}>{f.type}</option>)}
                       </select>
                     </div>
                     <div className="field field-wide">
                       <label>Produces</label>
                       <select value={buildForm.resourceId}
                         onChange={(e) => setBuildForm((f) => ({ ...f, resourceId: e.target.value }))}>
-                        {scenario.resources.filter((r) => r.facility === buildForm.facilityType).map((r) => (
+                        {scenario.resources.filter((r) => r.facility === buildForm.facilityType && isDiscovered(r.id)).map((r) => (
                           <option key={r.id} value={r.id}>{r.name}</option>
                         ))}
                       </select>
@@ -557,22 +636,38 @@ function App() {
 
                 <h3 className="sub">Standing supply contracts</h3>
                 <table>
-                  <thead><tr><th>Side</th><th>Resource</th><th className="num">Qty/turn</th><th className="num">Price</th><th className="num">Turns</th><th className="num">Missed</th><th></th></tr></thead>
+                  <thead><tr><th>Side</th><th>Resource</th><th className="num">Qty/turn</th><th className="num">Price</th><th className="num">Turns</th><th className="num">Missed</th><th></th><th></th></tr></thead>
                   <tbody>
-                    {state.player.supplyContracts.map((c) => (
-                      <tr key={c.id}>
-                        <td className="muted">{c.side}</td>
-                        <td className="resource-name">{resourceName(c.resourceId)}</td>
-                        <td className="num">{c.qtyPerTurn}</td>
-                        <td className="num">{c.price}g</td>
-                        <td className="num">{c.turnsLeft} turns</td>
-                        <td className="num">{c.missedStreak}</td>
-                        <td><button onClick={() => cmd({ kind: 'cancelSupplyContract', id: c.id })}>Cancel · {c.cancelFine}g</button></td>
-                      </tr>
-                    ))}
-                    {state.player.supplyContracts.length === 0 && <tr><td colSpan={7} className="muted">None active.</td></tr>}
+                    {state.player.supplyContracts.map((c) => {
+                      const have = state.player.inventory[c.resourceId]?.qty ?? 0;
+                      const canSend = c.side === 'sell' ? have >= c.qtyPerTurn : state.player.cash >= c.qtyPerTurn * c.price;
+                      return (
+                        <tr key={c.id}>
+                          <td className="muted">{c.side}</td>
+                          <td className="resource-name">{resourceName(c.resourceId)}</td>
+                          <td className="num">{c.qtyPerTurn}</td>
+                          <td className="num">{c.price}g</td>
+                          <td className="num">{c.turnsLeft} turns</td>
+                          <td className="num">{c.missedStreak}</td>
+                          <td>
+                            {c.settledThisTurn ? (
+                              <span className="muted">Sent</span>
+                            ) : (
+                              <button disabled={!canSend} onClick={() => cmd({ kind: 'sendSupplyContractNow', id: c.id })}>
+                                Send now
+                              </button>
+                            )}
+                          </td>
+                          <td><button onClick={() => cmd({ kind: 'cancelSupplyContract', id: c.id })}>Cancel · {c.cancelFine}g</button></td>
+                        </tr>
+                      );
+                    })}
+                    {state.player.supplyContracts.length === 0 && <tr><td colSpan={8} className="muted">None active.</td></tr>}
                   </tbody>
                 </table>
+                <p className="hint">
+                  "Send now" settles this turn's delivery/purchase early — the automatic end-of-turn settlement is skipped once it's sent.
+                </p>
                 <div className="supply-form">
                   <div className="form-row">
                     <div className="field">
@@ -759,22 +854,35 @@ function App() {
                 <table>
                   <thead><tr><th>Resource</th><th className="num">Cost</th><th className="num">Due in</th><th></th></tr></thead>
                   <tbody>
-                    {bills.licenseRenewals.map((l) => (
-                      <tr key={l.resourceId}>
-                        <td className="resource-name">{resourceName(l.resourceId)}</td>
-                        <td className="num">{l.cost}g</td>
-                        <td className="num">{l.turnsUntilRenewal} turns</td>
-                        <td>
-                          <button disabled={state.player.cash < l.cost}
-                            onClick={() => cmd({ kind: 'renewLicenseNow', resourceId: l.resourceId })}>
-                            Renew now
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                    {bills.licenseRenewals.map((l) => {
+                      const atRisk = state.player.cash < l.cost;
+                      return (
+                        <tr key={l.resourceId}>
+                          <td className="resource-name">{resourceName(l.resourceId)}</td>
+                          <td className="num">{l.cost}g</td>
+                          <td className="num">
+                            {l.turnsUntilRenewal} turns
+                            {atRisk && (
+                              <span className="warn-chip" title="You can't currently afford this renewal — it will suspend the license instead of charging you">
+                                ⚠ can't afford
+                              </span>
+                            )}
+                          </td>
+                          <td>
+                            <button disabled={state.player.cash < l.cost}
+                              onClick={() => cmd({ kind: 'renewLicenseNow', resourceId: l.resourceId })}>
+                              Renew now
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
                     {bills.licenseRenewals.length === 0 && <tr><td colSpan={4} className="muted">No licenses held.</td></tr>}
                   </tbody>
                 </table>
+                <p className="hint">
+                  If you can't afford a renewal when it comes due, the license suspends for a few turns instead of taking your cash negative.
+                </p>
                 <p className="hint">
                   Renewals are periodic (not charged every turn) — renewing early just resets the countdown, it doesn't discount the fee.
                   Facility upkeep/payroll can be paid a turn ahead — it just settles this turn's charge early, so the automatic

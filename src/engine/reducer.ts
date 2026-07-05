@@ -24,6 +24,15 @@ const INSURANCE_RATE = 0.02; // 2%/turn of asset value, per doc §6
 const LEGAL_RETAINER = 25; // per turn, per doc §9 balance numbers
 const LEVEL_CAPACITY_BONUS = 0.25; // +25% base capacity per level above 1
 export const MAX_FACILITY_LEVEL = 5;
+const RENEWAL_FAILURE_SUSPENSION_TURNS = 3; // per doc §3's "2-3 turns" suspension range
+
+// Ingredient-directed research targets a specific tier, so it's priced
+// steeper than the flat, random-outcome Breakthrough (scenario.researchCost) —
+// paying for precision.
+export const INGREDIENT_RESEARCH_COST_PER_TIER = 100;
+export function ingredientResearchCost(targetTier: number): number {
+  return targetTier * INGREDIENT_RESEARCH_COST_PER_TIER;
+}
 
 // Banking, per doc §6.9 "reduced to a single loan action": one unsecured
 // product, flat rate, no fixed/floating/secured choice or credit score.
@@ -149,15 +158,37 @@ function runUpkeep(state: GameState, scenario: ScenarioConfig) {
     lic.turnsUntilRenewal -= 1;
     if (lic.turnsUntilRenewal <= 0) {
       const def = licenseDefById(scenario, lic.resourceId);
-      player.cash -= def.renewalCost;
-      addLedger(state.ledger, state.turn, `License renewal: ${lic.resourceId}`, -def.renewalCost, player.cash);
-      lic.turnsUntilRenewal = def.renewalPeriod;
-      if (def.quotaPeriodTurns) {
-        if (lic.unitsProducedThisPeriod < (def.quotaPerPeriod ?? 0)) {
-          lic.status = 'lapsed';
-          addLedger(state.ledger, state.turn, `Quota missed — license lapsed: ${lic.resourceId}`, 0, player.cash);
+      if (player.cash < def.renewalCost) {
+        // Can't afford it — suspend instead of driving cash negative.
+        // turnsUntilRenewal is left at/below 0, so the charge retries every
+        // subsequent turn until it's affordable (or a fresh suspension keeps
+        // getting applied) rather than resetting on a missed payment.
+        lic.status = 'suspended';
+        lic.suspendedTurnsLeft = RENEWAL_FAILURE_SUSPENSION_TURNS;
+        addLedger(
+          state.ledger,
+          state.turn,
+          `License renewal failed — suspended: ${lic.resourceId} (need ${def.renewalCost}g)`,
+          0,
+          player.cash
+        );
+      } else {
+        player.cash -= def.renewalCost;
+        addLedger(state.ledger, state.turn, `License renewal: ${lic.resourceId}`, -def.renewalCost, player.cash);
+        lic.turnsUntilRenewal = def.renewalPeriod;
+        // Catching up on an overdue payment lifts a nonpayment suspension
+        // immediately, rather than waiting out the rest of its timer.
+        if (lic.status === 'suspended') {
+          lic.status = 'active';
+          lic.suspendedTurnsLeft = undefined;
         }
-        lic.unitsProducedThisPeriod = 0;
+        if (def.quotaPeriodTurns) {
+          if (lic.unitsProducedThisPeriod < (def.quotaPerPeriod ?? 0)) {
+            lic.status = 'lapsed';
+            addLedger(state.ledger, state.turn, `Quota missed — license lapsed: ${lic.resourceId}`, 0, player.cash);
+          }
+          lic.unitsProducedThisPeriod = 0;
+        }
       }
     }
   }
@@ -391,7 +422,7 @@ function runAutoProduction(state: GameState, scenario: ScenarioConfig) {
 
 // --- Passive per-tick processing (no player input) -------------------------
 
-function runResearchProgress(state: GameState) {
+function runResearchProgress(state: GameState, scenario: ScenarioConfig) {
   const player = state.player;
   if (!player.knowledge.activeCommission) return;
   const commission = player.knowledge.activeCommission;
@@ -410,13 +441,15 @@ function runResearchProgress(state: GameState) {
     );
   } else {
     // Ingredient-directed: discover a crafted recipe whose inputs are all among
-    // the chosen ingredients (and each is known-to-make).
+    // the chosen ingredients (and each is known-to-make), AND whose output is
+    // the tier the player paid to target.
     const chosenSet = new Set(commission.ingredients ?? []);
     candidates = state.recipes.filter(
       (r) =>
         !known.has(r.id) &&
         r.inputs.length > 0 &&
-        r.inputs.every((i) => chosenSet.has(i.ingredientId) && isResourceKnown(i.ingredientId))
+        r.inputs.every((i) => chosenSet.has(i.ingredientId) && isResourceKnown(i.ingredientId)) &&
+        resourceById(scenario, r.output).tier === commission.targetTier
     );
   }
 
@@ -462,7 +495,11 @@ export function estimateRecipeSalePrice(resource: Resource): number {
 function runSupplyContracts(state: GameState) {
   const player = state.player;
   player.supplyContracts = player.supplyContracts.filter((c) => {
-    if (c.side === 'sell') {
+    if (c.settledThisTurn) {
+      // Already sent/bought early this turn via sendSupplyContractNow —
+      // don't settle again, just clear the flag for next turn.
+      c.settledThisTurn = false;
+    } else if (c.side === 'sell') {
       const have = player.inventory[c.resourceId]?.qty ?? 0;
       if (have >= c.qtyPerTurn) {
         player.inventory[c.resourceId].qty -= c.qtyPerTurn;
@@ -585,7 +622,7 @@ export function tick(prevState: GameState, scenario: ScenarioConfig): GameState 
   runMarket(state, scenario);
   runContractBoard(state, scenario);
   runAutoProduction(state, scenario);
-  runResearchProgress(state);
+  runResearchProgress(state, scenario);
   runExclusivityClock(state);
   runSupplyContracts(state);
   runLoanPayments(state);
@@ -611,7 +648,7 @@ export type Command =
   | { kind: 'toggleInsurance'; on: boolean }
   | { kind: 'toggleLegalTeam'; on: boolean }
   | { kind: 'researchBlind' }
-  | { kind: 'researchByIngredients'; ingredients: ResourceId[] }
+  | { kind: 'researchByIngredients'; ingredients: ResourceId[]; targetTier: number }
   | { kind: 'acceptQuestContract'; id: string }
   | { kind: 'acceptStandingOffer'; id: string }
   | { kind: 'deliverQuestContract'; id: string }
@@ -625,6 +662,7 @@ export type Command =
       turnsLeft: number;
     }
   | { kind: 'cancelSupplyContract'; id: string }
+  | { kind: 'sendSupplyContractNow'; id: string }
   | { kind: 'lawsuitDecision'; decision: 'settle' | 'fight' }
   | { kind: 'resolveDisclosure'; choice: 'free' | 'exclusive' | 'sell' }
   | { kind: 'takeLoan'; amount: number }
@@ -729,6 +767,9 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
           upkeepPrepaid: false,
         };
         player.facilities.push(newFacility);
+        // New facilities default to producing — matches the starting
+        // facility's default; the player can still switch it off in Facilities.
+        if (!player.autoProduce.includes(cmd.resourceId)) player.autoProduce = [...player.autoProduce, cmd.resourceId];
         addLedger(state.ledger, state.turn, `Built facility: ${def.type} → ${cmd.resourceId}`, -def.buildCost, player.cash);
       }
       break;
@@ -758,6 +799,8 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
       const resource = resourceById(scenario, cmd.resourceId);
       if (facility && resource.facility === facility.type) {
         facility.assignedResourceId = cmd.resourceId;
+        // Reassigning defaults to producing the new output too.
+        if (!player.autoProduce.includes(cmd.resourceId)) player.autoProduce = [...player.autoProduce, cmd.resourceId];
         addLedger(state.ledger, state.turn, `Reassigned ${facility.type} to ${cmd.resourceId}`, 0, player.cash);
       }
       break;
@@ -793,15 +836,22 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
       break;
 
     case 'researchBlind':
-      if (!player.knowledge.activeCommission) {
+      if (!player.knowledge.activeCommission && player.cash >= scenario.researchCost) {
+        player.cash -= scenario.researchCost;
         player.knowledge.activeCommission = { blind: true, turnsLeft: 3 };
+        addLedger(state.ledger, state.turn, 'Commissioned research (breakthrough)', -scenario.researchCost, player.cash);
       }
       break;
 
-    case 'researchByIngredients':
-      if (!player.knowledge.activeCommission && cmd.ingredients.length > 0) {
-        player.knowledge.activeCommission = { ingredients: [...cmd.ingredients], turnsLeft: 3 };
+    case 'researchByIngredients': {
+      const cost = ingredientResearchCost(cmd.targetTier);
+      if (!player.knowledge.activeCommission && cmd.ingredients.length > 0 && cmd.targetTier > 0 && player.cash >= cost) {
+        player.cash -= cost;
+        player.knowledge.activeCommission = { ingredients: [...cmd.ingredients], turnsLeft: 3, targetTier: cmd.targetTier };
+        addLedger(state.ledger, state.turn, `Commissioned research (ingredients, tier ${cmd.targetTier})`, -cost, player.cash);
       }
+      break;
+    }
       break;
 
     case 'produce':
@@ -862,6 +912,7 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
           turnsLeft: offer.turnsLeft,
           cancelFine: Math.round(3 * offer.qtyPerTurn * offer.price),
           missedStreak: 0,
+          settledThisTurn: false,
         });
         addLedger(state.ledger, state.turn, `Accepted standing offer: ${offer.resourceId}`, 0, player.cash);
       }
@@ -879,6 +930,7 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
         turnsLeft: cmd.turnsLeft,
         cancelFine: Math.round(3 * cmd.qtyPerTurn * cmd.price),
         missedStreak: 0,
+        settledThisTurn: false,
       });
       addLedger(state.ledger, state.turn, `Proposed supply contract: ${cmd.resourceId}`, 0, player.cash);
       break;
@@ -890,6 +942,38 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
         const [c] = player.supplyContracts.splice(idx, 1);
         player.cash -= c.cancelFine;
         addLedger(state.ledger, state.turn, `Cancelled supply contract: ${c.resourceId}`, -c.cancelFine, player.cash);
+      }
+      break;
+    }
+
+    // Settles this turn's delivery/purchase right now instead of waiting for
+    // the automatic end-of-turn settlement — same anti-double-charge pattern
+    // as payLoanNow/renewLicenseNow/payFacilityUpkeepNow: runSupplyContracts
+    // skips a contract marked settledThisTurn and just resets the flag.
+    case 'sendSupplyContractNow': {
+      const c = player.supplyContracts.find((sc) => sc.id === cmd.id);
+      if (c && !c.settledThisTurn) {
+        if (c.side === 'sell') {
+          const have = player.inventory[c.resourceId]?.qty ?? 0;
+          if (have >= c.qtyPerTurn) {
+            player.inventory[c.resourceId].qty -= c.qtyPerTurn;
+            player.cash += c.qtyPerTurn * c.price;
+            c.missedStreak = 0;
+            c.settledThisTurn = true;
+            addLedger(state.ledger, state.turn, `Sent early: ${c.resourceId}`, c.qtyPerTurn * c.price, player.cash);
+          }
+        } else {
+          const cost = c.qtyPerTurn * c.price;
+          if (player.cash >= cost) {
+            player.cash -= cost;
+            const inv = player.inventory[c.resourceId] ?? { qty: 0, ageTurns: 0 };
+            inv.qty += c.qtyPerTurn;
+            player.inventory[c.resourceId] = inv;
+            c.missedStreak = 0;
+            c.settledThisTurn = true;
+            addLedger(state.ledger, state.turn, `Bought early: ${c.resourceId}`, -cost, player.cash);
+          }
+        }
       }
       break;
     }

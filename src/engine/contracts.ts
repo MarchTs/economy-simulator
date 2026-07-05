@@ -7,7 +7,7 @@ const CUSTOMER_BOARD_TARGET_SIZE = 2;
 const OFFER_LIFETIME_TURNS = 4;
 const STANDING_BOARD_TARGET_SIZE = 2;
 
-const ISSUERS = ['Local co-op', 'Regional distributor', 'Government procurement', 'Rival brewer'];
+const ISSUERS = ['Local co-op', 'Regional distributor', 'Government procurement', 'Rival producer'];
 
 interface QuestOfferRanges {
   issuer: string | string[];

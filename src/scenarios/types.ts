@@ -21,6 +21,7 @@ export interface ScenarioConfig {
   startingFacility: { type: string };
   startingLicenseResourceId: ResourceIdChoice;
   startingKnownRecipeIds: string[];
+  researchCost: number; // charged upfront when starting a commission (blind or ingredient-directed)
 }
 
 // The scenario offers a small set of valid starting licenses (tier 0 goods);

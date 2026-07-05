@@ -7,10 +7,13 @@ const resources: Resource[] = [
   { id: 'barley', name: 'Barley', tier: 0, basePrice: 4, facility: 'farm' },
   { id: 'hops', name: 'Hops', tier: 0, basePrice: 12, facility: 'farm' },
   { id: 'rice', name: 'Rice', tier: 0, basePrice: 3, facility: 'farm' },
+  { id: 'wheat', name: 'Wheat', tier: 0, basePrice: 3, facility: 'farm' },
+  { id: 'apple', name: 'Apple', tier: 0, basePrice: 5, facility: 'farm' },
   { id: 'silica_sand', name: 'Silica Sand', tier: 0, basePrice: 3, facility: 'quarry' },
   { id: 'aluminum_ore', name: 'Aluminum Ore', tier: 0, basePrice: 6, facility: 'quarry' },
 
   { id: 'malt', name: 'Malt', tier: 1, basePrice: 12, facility: 'malthouse' },
+  { id: 'wheat_malt', name: 'Wheat Malt', tier: 1, basePrice: 11, facility: 'malthouse' },
   { id: 'yeast_culture', name: 'Yeast Culture', tier: 1, basePrice: 8, facility: 'lab' },
   { id: 'glass_bottle', name: 'Glass Bottle', tier: 1, basePrice: 9, facility: 'glassworks' },
   { id: 'aluminum_can', name: 'Aluminum Can', tier: 1, basePrice: 8, facility: 'can_plant' },
@@ -21,6 +24,20 @@ const resources: Resource[] = [
     name: 'Keg Beer (rice variant)',
     tier: 2,
     basePrice: 55,
+    facility: 'brewery',
+  },
+  {
+    id: 'wheat_beer',
+    name: 'Wheat Beer',
+    tier: 2,
+    basePrice: 65,
+    facility: 'brewery',
+  },
+  {
+    id: 'hard_cider',
+    name: 'Hard Cider',
+    tier: 2,
+    basePrice: 60,
     facility: 'brewery',
   },
 
@@ -40,6 +57,14 @@ const resources: Resource[] = [
     facility: 'packaging_plant',
     shelfLifeTurns: 12,
   },
+  {
+    id: 'bottled_cider',
+    name: 'Bottled Cider',
+    tier: 3,
+    basePrice: 130,
+    facility: 'packaging_plant',
+    shelfLifeTurns: 12,
+  },
 ];
 
 // Tier-0 "extraction recipes": no inputs, unlocked by research/discovery.
@@ -48,6 +73,8 @@ const extractionRecipes: Recipe[] = [
   { id: 'recipe_extract_barley', output: 'barley', outputQty: 1, facility: 'farm', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_hops', output: 'hops', outputQty: 1, facility: 'farm', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_rice', output: 'rice', outputQty: 1, facility: 'farm', inputs: [], published: false, communityLevel: 0 },
+  { id: 'recipe_extract_wheat', output: 'wheat', outputQty: 1, facility: 'farm', inputs: [], published: false, communityLevel: 0 },
+  { id: 'recipe_extract_apple', output: 'apple', outputQty: 1, facility: 'farm', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_silica_sand', output: 'silica_sand', outputQty: 1, facility: 'quarry', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_aluminum_ore', output: 'aluminum_ore', outputQty: 1, facility: 'quarry', inputs: [], published: false, communityLevel: 0 },
 ];
@@ -108,6 +135,40 @@ const recipes: Recipe[] = [
     communityLevel: 0,
   },
   {
+    id: 'recipe_wheat_malt',
+    output: 'wheat_malt',
+    outputQty: 1,
+    facility: 'malthouse',
+    inputs: [{ ingredientId: 'wheat', qty: 2 }],
+    published: false,
+    communityLevel: 0,
+  },
+  {
+    id: 'recipe_wheat_beer',
+    output: 'wheat_beer',
+    outputQty: 1,
+    facility: 'brewery',
+    inputs: [
+      { ingredientId: 'wheat_malt', qty: 3 },
+      { ingredientId: 'hops', qty: 1 },
+      { ingredientId: 'yeast_culture', qty: 1 },
+    ],
+    published: false,
+    communityLevel: 0,
+  },
+  {
+    id: 'recipe_hard_cider',
+    output: 'hard_cider',
+    outputQty: 1,
+    facility: 'brewery',
+    inputs: [
+      { ingredientId: 'apple', qty: 4 },
+      { ingredientId: 'yeast_culture', qty: 1 },
+    ],
+    published: false,
+    communityLevel: 0,
+  },
+  {
     id: 'recipe_bottled_beer',
     output: 'bottled_beer',
     outputQty: 1,
@@ -131,6 +192,18 @@ const recipes: Recipe[] = [
     published: false,
     communityLevel: 0,
   },
+  {
+    id: 'recipe_bottled_cider',
+    output: 'bottled_cider',
+    outputQty: 1,
+    facility: 'packaging_plant',
+    inputs: [
+      { ingredientId: 'hard_cider', qty: 1 },
+      { ingredientId: 'glass_bottle', qty: 6 },
+    ],
+    published: false,
+    communityLevel: 0,
+  },
 ];
 
 // Note: yeast_culture has a facility ('lab') but no recipe — produced from
@@ -140,10 +213,13 @@ const licenses: LicenseDef[] = [
   { resourceId: 'barley', class: 'open', upfrontCost: 50, renewalCost: 10, renewalPeriod: 5, minReputation: 0 },
   { resourceId: 'hops', class: 'open', upfrontCost: 60, renewalCost: 12, renewalPeriod: 5, minReputation: 0 },
   { resourceId: 'rice', class: 'open', upfrontCost: 40, renewalCost: 8, renewalPeriod: 5, minReputation: 0 },
+  { resourceId: 'wheat', class: 'open', upfrontCost: 40, renewalCost: 8, renewalPeriod: 5, minReputation: 0 },
+  { resourceId: 'apple', class: 'open', upfrontCost: 45, renewalCost: 9, renewalPeriod: 5, minReputation: 0 },
   { resourceId: 'silica_sand', class: 'open', upfrontCost: 40, renewalCost: 8, renewalPeriod: 5, minReputation: 0 },
   { resourceId: 'aluminum_ore', class: 'open', upfrontCost: 55, renewalCost: 11, renewalPeriod: 5, minReputation: 0 },
 
   { resourceId: 'malt', class: 'closed', upfrontCost: 350, renewalCost: 45, renewalPeriod: 5, minReputation: 0 },
+  { resourceId: 'wheat_malt', class: 'closed', upfrontCost: 350, renewalCost: 45, renewalPeriod: 5, minReputation: 0 },
   { resourceId: 'yeast_culture', class: 'closed', upfrontCost: 300, renewalCost: 40, renewalPeriod: 5, minReputation: 0 },
   { resourceId: 'glass_bottle', class: 'closed', upfrontCost: 400, renewalCost: 50, renewalPeriod: 5, minReputation: 10 },
   { resourceId: 'aluminum_can', class: 'closed', upfrontCost: 400, renewalCost: 50, renewalPeriod: 5, minReputation: 10 },
@@ -168,8 +244,29 @@ const licenses: LicenseDef[] = [
     quotaPerPeriod: 15,
     quotaPeriodTurns: 10,
   },
+  {
+    resourceId: 'wheat_beer',
+    class: 'closed',
+    upfrontCost: 4000,
+    renewalCost: 350,
+    renewalPeriod: 5,
+    minReputation: 40,
+    quotaPerPeriod: 18,
+    quotaPeriodTurns: 10,
+  },
+  {
+    resourceId: 'hard_cider',
+    class: 'closed',
+    upfrontCost: 3000,
+    renewalCost: 250,
+    renewalPeriod: 5,
+    minReputation: 30,
+    quotaPerPeriod: 15,
+    quotaPeriodTurns: 10,
+  },
   { resourceId: 'bottled_beer', class: 'closed', upfrontCost: 800, renewalCost: 100, renewalPeriod: 5, minReputation: 30 },
   { resourceId: 'canned_beer', class: 'closed', upfrontCost: 800, renewalCost: 100, renewalPeriod: 5, minReputation: 30 },
+  { resourceId: 'bottled_cider', class: 'closed', upfrontCost: 700, renewalCost: 90, renewalPeriod: 5, minReputation: 25 },
 ];
 
 const facilityTypes: FacilityTypeDef[] = [
@@ -194,4 +291,5 @@ export const breweryScenario: ScenarioConfig = {
   startingFacility: { type: 'farm' },
   startingLicenseResourceId: ['barley'],
   startingKnownRecipeIds: ['recipe_extract_barley'],
+  researchCost: 80,
 };

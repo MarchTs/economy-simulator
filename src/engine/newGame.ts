@@ -45,7 +45,14 @@ const RIVAL_NAMES: { name: string; personality: RivalCompany['personality'] }[] 
   { name: 'Heritage Brewers', personality: 'premium' },
 ];
 
+// Rivals start selling whatever the scenario's first publicly-known recipe
+// makes (Brewery: Malt; Bakery: Flour) — scenario-driven so this isn't
+// hardcoded to one industry's output.
 function makeRivals(scenario: ScenarioConfig): RivalCompany[] {
+  const publishedRecipes = scenario.recipes.filter((rc) => rc.published);
+  const flagshipResourceId = publishedRecipes[0]?.output ?? scenario.resources[0].id;
+  const flagshipResource = scenario.resources.find((r) => r.id === flagshipResourceId)!;
+
   return RIVAL_NAMES.map((r, i) => ({
     id: `rival_${i + 1}`,
     name: r.name,
@@ -53,11 +60,11 @@ function makeRivals(scenario: ScenarioConfig): RivalCompany[] {
     cash: 4000,
     reputation: 50,
     licenses: [
-      { resourceId: 'malt', status: 'active', turnsUntilRenewal: 5, unitsProducedThisPeriod: 0 },
+      { resourceId: flagshipResourceId, status: 'active', turnsUntilRenewal: 5, unitsProducedThisPeriod: 0 },
     ],
-    knownRecipeIds: new Set(scenario.recipes.filter((rc) => rc.published).map((rc) => rc.id)),
-    postedPrices: { malt: 12 },
-    unitCost: { malt: 9 },
+    knownRecipeIds: new Set(publishedRecipes.map((rc) => rc.id)),
+    postedPrices: { [flagshipResourceId]: flagshipResource.basePrice },
+    unitCost: { [flagshipResourceId]: Math.round(flagshipResource.basePrice * 0.75) },
     cumulativeLoss: {},
   }));
 }
@@ -74,7 +81,7 @@ export function newGame(scenario: ScenarioConfig, seed: number): GameState {
       knownRecipeIds: new Set(scenario.startingKnownRecipeIds),
       labLevel: 1,
     },
-    autoProduce: [],
+    autoProduce: [scenario.startingLicenseResourceId[0]],
     questContracts: [],
     supplyContracts: [],
     loans: [],

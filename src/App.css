@@ -304,6 +304,18 @@ tr:hover td {
   margin: 8px 4px 0;
 }
 
+.warn-chip {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #4a2a2088;
+  border: 1px solid #a0453a;
+  color: #f0a898;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 h3.sub {
   font-size: 13.5px;
   color: var(--amber-dim);
@@ -493,7 +505,7 @@ h3.sub {
   border-color: var(--amber-bright);
 }
 
-/* ---- Lawsuit modal ---- */
+/* ---- Dismissible dialogs (recipe tree, market intel) — click backdrop or ✕ to close, blocks the page while open ---- */
 
 .modal-overlay {
   position: fixed;
@@ -531,6 +543,56 @@ h3.sub {
 }
 
 .modal .choices button.selected {
+  border-color: var(--amber);
+  color: var(--amber-bright);
+}
+
+/* ---- Non-blocking prompts (lawsuit decision, discovery disclosure) ----
+   These can be left open indefinitely (see their in-card hint text), so
+   unlike .modal-overlay above they must NOT eat clicks meant for the rest
+   of the page — notably the End Turn button. Only .prompt-card itself
+   re-enables pointer-events, and there's no full-page dimming since the
+   rest of the page stays genuinely interactive. */
+
+.prompt-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  padding: 24px;
+  z-index: 50;
+  pointer-events: none;
+}
+
+.prompt-card {
+  width: 440px;
+  max-width: 90vw;
+  background: var(--panel-solid);
+  border: 1px solid #6e3a2a;
+  border-radius: 12px;
+  padding: 22px 26px;
+  pointer-events: auto;
+  box-shadow: 0 8px 32px #000000aa;
+}
+
+.prompt-card h3 {
+  color: #f0c0a8;
+  margin-bottom: 10px;
+}
+
+.prompt-card .choices {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.prompt-card .choices button {
+  flex: 1;
+  padding: 8px;
+}
+
+.prompt-card .choices button.selected {
   border-color: var(--amber);
   color: var(--amber-bright);
 }
@@ -742,4 +804,79 @@ h3.sub {
 .game-over h1 {
   font-size: 42px;
   color: var(--amber-bright);
+}
+
+/* ---- Scenario picker ---- */
+
+.scenario-picker {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  text-align: center;
+  padding: 24px;
+}
+
+.scenario-picker h1 {
+  font-family: var(--serif);
+  font-size: 36px;
+  color: var(--amber-bright);
+  margin: 0;
+}
+
+.scenario-cards {
+  display: flex;
+  gap: 18px;
+  margin-top: 18px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.scenario-card {
+  width: 260px;
+  padding: 18px;
+  background: linear-gradient(180deg, #35251388, #2b1d1088);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--cream);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.scenario-card:hover {
+  border-color: var(--amber-bright);
+}
+
+.scenario-card h2 {
+  font-family: var(--serif);
+  color: var(--amber-bright);
+  margin: 0 0 8px;
+  font-size: 20px;
+}
+
+.scenario-card p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+/* ---- Header exit button ---- */
+
+.exit-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.exit-btn:hover {
+  color: var(--cream);
+  border-color: var(--amber-bright);
 }

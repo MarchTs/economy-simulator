@@ -46,8 +46,9 @@ export interface PendingDisclosure {
 export interface CompanyKnowledge {
   knownRecipeIds: Set<string>;
   // A commission is either blind (find any newly-eligible recipe) or
-  // ingredient-directed (find a recipe made from the chosen ingredients).
-  activeCommission?: { ingredients?: ResourceId[]; blind?: boolean; turnsLeft: number };
+  // ingredient-directed (find a recipe of the target tier made from the
+  // chosen ingredients).
+  activeCommission?: { ingredients?: ResourceId[]; blind?: boolean; turnsLeft: number; targetTier?: number };
   labLevel: number; // raises tinkering success chance
 }
 
@@ -119,6 +120,7 @@ export interface SupplyContract {
   turnsLeft: number;
   cancelFine: number;
   missedStreak: number;
+  settledThisTurn: boolean; // true if sent/bought early via sendSupplyContractNow; runSupplyContracts skips it and resets the flag
 }
 
 // A board offer for a recurring "sell N/minute for T minutes" deal — the

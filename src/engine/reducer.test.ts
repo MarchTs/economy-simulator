@@ -5,6 +5,7 @@ import {
   applyCommand,
   effectiveCapacity,
   estimateBills,
+  ingredientResearchCost,
   levelUpCost,
   levelUpDuration,
   loanCreditLimit,
@@ -34,6 +35,11 @@ describe('newGame', () => {
     expect(state.player.cash).toBe(breweryScenario.startingCash);
     expect(state.player.licenses).toHaveLength(1);
     expect(state.player.licenses[0].status).toBe('active');
+  });
+
+  it('starts with the starting facility already auto-producing', () => {
+    const state = newGame(breweryScenario, 42);
+    expect(state.player.autoProduce).toContain(breweryScenario.startingLicenseResourceId[0]);
   });
 });
 
@@ -182,6 +188,9 @@ describe('applyCommand — production & licensing', () => {
 
   it('caps production at per-tick capacity even across repeated commands', () => {
     let state = newGame(breweryScenario, 5);
+    // Isolate manual production from the default auto-produce (facilities
+    // now default to on) so this test's capacity math stays exact.
+    state = applyCommand(state, { kind: 'toggleAutoProduce', resourceId: 'barley', on: false }, breweryScenario);
     // Farm capacity is 20/tick. Five produce commands of 10 should not exceed 20.
     for (let i = 0; i < 5; i++) {
       state = applyCommand(state, { kind: 'produce', resourceId: 'barley', qty: 10 }, breweryScenario);
@@ -218,6 +227,9 @@ describe('applyCommand — production & licensing', () => {
 
   it('does not auto-produce a crafted good when its ingredients are missing', () => {
     let state = newGame(breweryScenario, 5);
+    // Facilities default to auto-producing now — turn off barley so it can't
+    // passively restock the malthouse's ingredient within the same tick.
+    state = applyCommand(state, { kind: 'toggleAutoProduce', resourceId: 'barley', on: false }, breweryScenario);
     state.player.knowledge.knownRecipeIds.add('recipe_malt');
     state.player.licenses.push({ resourceId: 'malt', status: 'active', turnsUntilRenewal: 5, unitsProducedThisPeriod: 0 });
     state.player.facilities.push({
@@ -263,6 +275,24 @@ describe('facility dedication & leveling', () => {
     // The sole farm is now dedicated to hops, so barley can no longer be made.
     const madeBarley = applyCommand(state, { kind: 'produce', resourceId: 'barley', qty: 5 }, breweryScenario);
     expect(madeBarley.player.inventory['barley']?.qty ?? 0).toBe(0);
+  });
+
+  it('reassigning a facility defaults the new resource to auto-producing', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.licenses.push({ resourceId: 'hops', status: 'active', turnsUntilRenewal: 5, unitsProducedThisPeriod: 0 });
+    state.player.knowledge.knownRecipeIds.add('recipe_extract_hops');
+    const farmId = state.player.facilities[0].id;
+    state = applyCommand(state, { kind: 'reassignFacility', facilityId: farmId, resourceId: 'hops' }, breweryScenario);
+    expect(state.player.autoProduce).toContain('hops');
+  });
+
+  it('a newly built facility defaults to auto-producing its assigned resource', () => {
+    const state = applyCommand(
+      newGame(breweryScenario, 5),
+      { kind: 'buildFacility', facilityType: 'quarry', resourceId: 'silica_sand' },
+      breweryScenario
+    );
+    expect(state.player.autoProduce).toContain('silica_sand');
   });
 
   it('leveling up costs cash and time, and keeps producing at the current level meanwhile', () => {
@@ -328,7 +358,7 @@ describe('applyCommand — research ladder', () => {
 
   it('ingredient-directed research discovers a recipe built from the chosen ingredients', () => {
     let state = newGame(breweryScenario, 6);
-    state = step(state, [{ kind: 'researchByIngredients', ingredients: ['barley'] }]);
+    state = step(state, [{ kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 1 }]);
     state = step(state);
     state = step(state);
     expect(state.player.knowledge.knownRecipeIds.has('recipe_malt')).toBe(true);
@@ -336,17 +366,110 @@ describe('applyCommand — research ladder', () => {
 
   it('ingredient-directed research will not discover a recipe needing unselected ingredients', () => {
     let state = newGame(breweryScenario, 6);
-    state = step(state, [{ kind: 'researchByIngredients', ingredients: ['barley'] }]);
+    state = step(state, [{ kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 1 }]);
     state = step(state);
     state = step(state);
     expect(state.player.knowledge.knownRecipeIds.has('recipe_keg_beer')).toBe(false);
+  });
+
+  it('blind research charges the scenario research cost upfront', () => {
+    let state = newGame(breweryScenario, 4);
+    const cashBefore = state.player.cash;
+    state = applyCommand(state, { kind: 'researchBlind' }, breweryScenario);
+    expect(state.player.cash).toBe(cashBefore - breweryScenario.researchCost);
+  });
+
+  it('ingredient-directed research charges tier × 100, not the flat breakthrough cost', () => {
+    let state = newGame(breweryScenario, 6);
+    const cashBefore = state.player.cash;
+    state = applyCommand(state, { kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 1 }, breweryScenario);
+    expect(state.player.cash).toBe(cashBefore - ingredientResearchCost(1));
+    expect(ingredientResearchCost(1)).toBe(100);
+  });
+
+  it('ingredient-directed research cost scales with the targeted tier', () => {
+    let state = newGame(breweryScenario, 6);
+    state.player.cash = 10000;
+    const cashBefore = state.player.cash;
+    state = applyCommand(state, { kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 3 }, breweryScenario);
+    expect(state.player.cash).toBe(cashBefore - 300);
+    expect(state.player.knowledge.activeCommission?.targetTier).toBe(3);
+  });
+
+  it('cannot start research without enough cash', () => {
+    let state = newGame(breweryScenario, 4);
+    state.player.cash = breweryScenario.researchCost - 1;
+    const next = applyCommand(state, { kind: 'researchBlind' }, breweryScenario);
+    expect(next.player.knowledge.activeCommission).toBeUndefined();
+    expect(next.player.cash).toBe(state.player.cash);
+  });
+
+  it('cannot start ingredient-directed research without enough cash for the target tier', () => {
+    let state = newGame(breweryScenario, 6);
+    state.player.cash = ingredientResearchCost(1) - 1;
+    const next = applyCommand(state, { kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 1 }, breweryScenario);
+    expect(next.player.knowledge.activeCommission).toBeUndefined();
+    expect(next.player.cash).toBe(state.player.cash);
+  });
+
+  it('only discovers a recipe whose output matches the targeted tier', () => {
+    let state = newGame(breweryScenario, 6);
+    state.player.cash = 10000;
+    // recipe_malt (output 'malt') is tier 1 — targeting tier 2 with the same
+    // ingredient set should find nothing, even though malt is reachable.
+    state = step(state, [{ kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 2 }]);
+    state = step(state);
+    state = step(state);
+    expect(state.player.knowledge.knownRecipeIds.has('recipe_malt')).toBe(false);
+  });
+
+  it('reaching a tier-3 recipe requires already knowing AND selecting its tier-2 ingredient — a tier-0 ingredient alone finds nothing', () => {
+    let state = newGame(breweryScenario, 1);
+    state.player.cash = 10000;
+    // No tier-3 recipe (bottled/canned beer) is buildable from barley alone —
+    // they all require keg_beer (tier 2) plus a packaging good (tier 1).
+    state = applyCommand(state, { kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 3 }, breweryScenario);
+    state = tick(state, breweryScenario);
+    state = tick(state, breweryScenario);
+    state = tick(state, breweryScenario);
+    expect(state.player.knowledge.knownRecipeIds.has('recipe_bottled_beer')).toBe(false);
+    expect(state.player.knowledge.knownRecipeIds.has('recipe_canned_beer')).toBe(false);
+  });
+
+  it('discovers a tier-3 recipe once its full tier-2 + tier-1 ingredient set is known and selected', () => {
+    let state = newGame(breweryScenario, 1);
+    state.player.cash = 10000;
+    state.player.knowledge.knownRecipeIds.add('recipe_keg_beer');
+    state.player.knowledge.knownRecipeIds.add('recipe_glass_bottle');
+    state = applyCommand(
+      state,
+      { kind: 'researchByIngredients', ingredients: ['keg_beer', 'glass_bottle'], targetTier: 3 },
+      breweryScenario
+    );
+    state = tick(state, breweryScenario);
+    state = tick(state, breweryScenario);
+    state = tick(state, breweryScenario);
+    expect(state.player.knowledge.knownRecipeIds.has('recipe_bottled_beer')).toBe(true);
+  });
+
+  it('knowing a tier-2 ingredient is not enough — it must also be selected, or a tier-3 recipe needing it is not found', () => {
+    let state = newGame(breweryScenario, 1);
+    state.player.cash = 10000;
+    state.player.knowledge.knownRecipeIds.add('recipe_keg_beer');
+    state.player.knowledge.knownRecipeIds.add('recipe_glass_bottle');
+    // Only keg_beer is selected — glass_bottle is known but left out of the pick.
+    state = applyCommand(state, { kind: 'researchByIngredients', ingredients: ['keg_beer'], targetTier: 3 }, breweryScenario);
+    state = tick(state, breweryScenario);
+    state = tick(state, breweryScenario);
+    state = tick(state, breweryScenario);
+    expect(state.player.knowledge.knownRecipeIds.has('recipe_bottled_beer')).toBe(false);
   });
 });
 
 describe('discovery disclosure', () => {
   function discoverMalt(seed: number) {
     let state = newGame(breweryScenario, seed);
-    state = step(state, [{ kind: 'researchByIngredients', ingredients: ['barley'] }]);
+    state = step(state, [{ kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 1 }]);
     state = step(state);
     state = step(state);
     return state;
@@ -449,6 +572,9 @@ describe('applyCommand — contracts', () => {
     state = tick(state, breweryScenario);
     const offer = state.contractBoard[0];
     state = applyCommand(state, { kind: 'acceptQuestContract', id: offer.id }, breweryScenario);
+    // Facilities default to auto-producing now — clear any passively-grown
+    // inventory so "insufficient inventory" is actually true here.
+    state.player.inventory = {};
     const next = applyCommand(state, { kind: 'deliverQuestContract', id: offer.id }, breweryScenario);
     expect(next.player.questContracts.some((c) => c.id === offer.id)).toBe(true);
   });
@@ -482,6 +608,78 @@ describe('applyCommand — contracts', () => {
     const withoutC = tick(control, breweryScenario);
     expect(withC.player.cash - withoutC.player.cash).toBe(5 * 4);
     expect(withC.player.inventory['barley'].qty - withoutC.player.inventory['barley'].qty).toBe(-5);
+  });
+
+  it('sendSupplyContractNow settles a sell contract immediately', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.inventory['barley'] = { qty: 100, ageTurns: 0 };
+    state = applyCommand(
+      state,
+      { kind: 'proposeSupplyContract', side: 'sell', resourceId: 'barley', qtyPerTurn: 5, price: 4, turnsLeft: 3 },
+      breweryScenario
+    );
+    const id = state.player.supplyContracts[0].id;
+    const cashBefore = state.player.cash;
+
+    state = applyCommand(state, { kind: 'sendSupplyContractNow', id }, breweryScenario);
+    expect(state.player.cash).toBe(cashBefore + 5 * 4);
+    expect(state.player.inventory['barley'].qty).toBe(95);
+    expect(state.player.supplyContracts[0].settledThisTurn).toBe(true);
+  });
+
+  it('sendSupplyContractNow does not cause a double-settle at end of turn', () => {
+    let pathA = newGame(breweryScenario, 5);
+    pathA.player.inventory['barley'] = { qty: 100, ageTurns: 0 };
+    pathA = applyCommand(
+      pathA,
+      { kind: 'proposeSupplyContract', side: 'sell', resourceId: 'barley', qtyPerTurn: 5, price: 4, turnsLeft: 3 },
+      breweryScenario
+    );
+    const id = pathA.player.supplyContracts[0].id;
+    pathA = applyCommand(pathA, { kind: 'sendSupplyContractNow', id }, breweryScenario);
+    pathA = tick(pathA, breweryScenario);
+
+    let pathB = newGame(breweryScenario, 5);
+    pathB.player.inventory['barley'] = { qty: 100, ageTurns: 0 };
+    pathB = applyCommand(
+      pathB,
+      { kind: 'proposeSupplyContract', side: 'sell', resourceId: 'barley', qtyPerTurn: 5, price: 4, turnsLeft: 3 },
+      breweryScenario
+    );
+    pathB = tick(pathB, breweryScenario);
+
+    expect(pathA.player.cash).toBeCloseTo(pathB.player.cash, 5);
+    expect(pathA.player.inventory['barley'].qty).toBeCloseTo(pathB.player.inventory['barley'].qty, 5);
+    expect(pathA.player.supplyContracts[0].settledThisTurn).toBe(false); // flag reset after the tick
+  });
+
+  it('sendSupplyContractNow settles a buy contract immediately', () => {
+    let state = newGame(breweryScenario, 5);
+    state = applyCommand(
+      state,
+      { kind: 'proposeSupplyContract', side: 'buy', resourceId: 'hops', qtyPerTurn: 3, price: 12, turnsLeft: 5 },
+      breweryScenario
+    );
+    const id = state.player.supplyContracts[0].id;
+    const cashBefore = state.player.cash;
+
+    state = applyCommand(state, { kind: 'sendSupplyContractNow', id }, breweryScenario);
+    expect(state.player.cash).toBe(cashBefore - 3 * 12);
+    expect(state.player.inventory['hops'].qty).toBe(3);
+  });
+
+  it('sendSupplyContractNow does nothing if the resource stock is insufficient', () => {
+    let state = newGame(breweryScenario, 5);
+    state = applyCommand(
+      state,
+      { kind: 'proposeSupplyContract', side: 'sell', resourceId: 'barley', qtyPerTurn: 5, price: 4, turnsLeft: 3 },
+      breweryScenario
+    );
+    const id = state.player.supplyContracts[0].id;
+    const cashBefore = state.player.cash;
+    const next = applyCommand(state, { kind: 'sendSupplyContractNow', id }, breweryScenario);
+    expect(next.player.cash).toBe(cashBefore);
+    expect(next.player.supplyContracts[0].settledThisTurn).toBe(false);
   });
 
   it('charges the cancellation fine when a supply contract is cancelled', () => {
@@ -672,6 +870,62 @@ describe('bank loan', () => {
     const next = applyCommand(state, { kind: 'payLoanNow', loanId: loan.id }, breweryScenario);
     expect(next.player.loans).toHaveLength(0);
     expect(next.player.cash).toBe(cashBefore - 5);
+  });
+});
+
+describe('license renewal affordability', () => {
+  // No facility in these fixtures — isolates the license-renewal check from
+  // the unconditional facility upkeep/payroll charge (which would otherwise
+  // drive an already-cash-short player into bankruptcy for an unrelated
+  // reason and mask what's actually being tested).
+  it('suspends the license instead of charging a fee it cannot cover', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.facilities = [];
+    const def = breweryScenario.licenses.find((l) => l.resourceId === 'barley')!;
+    state.player.licenses[0].turnsUntilRenewal = 1;
+    state.player.cash = def.renewalCost - 1; // one gold short
+
+    const next = tick(state, breweryScenario);
+    expect(next.player.cash).toBe(def.renewalCost - 1); // unchanged — no charge went through
+    expect(next.player.licenses[0].status).toBe('suspended');
+    expect(next.player.licenses[0].suspendedTurnsLeft).toBeGreaterThan(0);
+  });
+
+  it('logs a distinct warning ledger entry when a renewal is unaffordable', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.facilities = [];
+    const def = breweryScenario.licenses.find((l) => l.resourceId === 'barley')!;
+    state.player.licenses[0].turnsUntilRenewal = 1;
+    state.player.cash = def.renewalCost - 1;
+
+    const next = tick(state, breweryScenario);
+    const warning = next.ledger.filter((e) => e.label.includes('License renewal failed'));
+    expect(warning).toHaveLength(1);
+    expect(warning[0].label).toContain('barley');
+  });
+
+  it('a suspended license blocks production regardless of what caused the suspension', () => {
+    const state = newGame(breweryScenario, 5);
+    state.player.licenses[0].status = 'suspended';
+    state.player.licenses[0].suspendedTurnsLeft = 3;
+    const next = applyCommand(state, { kind: 'produce', resourceId: 'barley', qty: 5 }, breweryScenario);
+    expect(next.player.inventory['barley']?.qty ?? 0).toBe(0);
+  });
+
+  it('retries the renewal once cash recovers, and clears the suspension on success', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.facilities = [];
+    const def = breweryScenario.licenses.find((l) => l.resourceId === 'barley')!;
+    state.player.licenses[0].turnsUntilRenewal = 1;
+    state.player.cash = def.renewalCost - 1;
+    state = tick(state, breweryScenario); // fails, suspends
+
+    state.player.cash = def.renewalCost + 100; // now affordable
+    const next = tick(state, breweryScenario);
+    const renewed = next.ledger.filter((e) => e.label === `License renewal: barley`);
+    expect(renewed).toHaveLength(1);
+    expect(next.player.licenses[0].turnsUntilRenewal).toBe(def.renewalPeriod);
+    expect(next.player.licenses[0].status).toBe('active'); // paying off catches up the suspension too
   });
 });
 
