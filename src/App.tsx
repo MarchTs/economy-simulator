@@ -31,7 +31,7 @@ const SCENARIOS: { config: ScenarioConfig; blurb: string }[] = [
 ];
 const SEED = 1234;
 
-type Tab = 'licenses' | 'research' | 'facilities' | 'contracts' | 'bank' | 'payments' | 'defenses';
+type Tab = 'licenses' | 'research' | 'facilities' | 'contracts' | 'bank' | 'payments' | 'defenses' | 'leaderboard';
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'licenses', label: 'Licenses' },
@@ -41,6 +41,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'bank', label: 'Bank' },
   { id: 'payments', label: 'Payments' },
   { id: 'defenses', label: 'Defenses' },
+  { id: 'leaderboard', label: 'Leaderboard' },
 ];
 
 function App() {
@@ -116,7 +117,7 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
     const fresh = state.ledger.slice(ledgerSeen.current);
     ledgerSeen.current = state.ledger.length;
     const interesting = fresh
-      .filter((e) => /discovered|Spoiled|breach|lawsuit|Quest|suspend|lapsed|fire|spike|flood|failure/i.test(e.label))
+      .filter((e) => /discovered|granted|Spoiled|breach|lawsuit|Quest|suspend|lapsed|fire|spike|flood|failure/i.test(e.label))
       .map((e) => e.label);
     if (interesting.length) setFlash((f) => [...interesting, ...f].slice(0, 4));
   }, [state.ledger]);
@@ -132,6 +133,24 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
     }, 0);
     return Math.round(state.player.cash + facilityValue + invValue - outstandingDebt(state.player));
   }, [state]);
+
+  const leaderboard = useMemo(() => {
+    // Rivals in this engine only track cash (no facilities/inventory model),
+    // so their standing is cash-only — not a perfect apples-to-apples with
+    // the player's full net worth, but it's the best available comparison.
+    const entries = [
+      { name: 'You', isPlayer: true, standing: netWorth, reputation: state.player.reputation, licenses: state.player.licenses.length, personality: undefined as string | undefined },
+      ...state.rivals.map((r) => ({
+        name: r.name,
+        isPlayer: false,
+        standing: Math.round(r.cash),
+        reputation: r.reputation,
+        licenses: r.licenses.length,
+        personality: r.personality as string | undefined,
+      })),
+    ];
+    return entries.sort((a, b) => b.standing - a.standing);
+  }, [state, netWorth]);
 
   const creditLimit = useMemo(() => loanCreditLimit(state.player, scenario), [state]);
   const bills = useMemo(() => estimateBills(state, scenario), [state]);
@@ -366,16 +385,31 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
                   </p>
                 )}
                 <table>
-                <thead><tr><th>Resource</th><th>Class</th><th className="num">Cost</th><th>Status</th><th></th></tr></thead>
+                <thead><tr><th>Resource</th><th>Class</th><th className="num">Cost</th><th>Status</th><th>Current owner(s)</th><th></th></tr></thead>
                 <tbody>
                   {visibleLicenses.map((def) => {
                     const held = state.player.licenses.find((l) => l.resourceId === def.resourceId);
+                    const recipe = state.recipes.find((rc) => rc.output === def.resourceId);
+                    const recipeKnown = recipe !== undefined && state.player.knowledge.knownRecipeIds.has(recipe.id);
+                    const owners: string[] = [];
+                    if (held) owners.push(held.status === 'active' ? 'You' : `You (${held.status})`);
+                    for (const rival of state.rivals) {
+                      const rivalLic = rival.licenses.find((l) => l.resourceId === def.resourceId && l.status === 'active');
+                      if (rivalLic) owners.push(rival.name);
+                    }
                     return (
                       <tr key={def.resourceId}>
                         <td className="resource-name">{resourceName(def.resourceId)}</td>
                         <td className="muted">{def.class}</td>
                         <td className="num">{def.upfrontCost}g + {def.renewalCost}g/{def.renewalPeriod} turns</td>
-                        <td>{held ? <span className="lic-yes">{held.status}</span> : <span className="muted">not held</span>}</td>
+                        <td>
+                          {held ? (
+                            <span className="lic-yes">{held.status}</span>
+                          ) : (
+                            <span className="muted">not held{recipeKnown ? ' — recipe known, license not bought' : ''}</span>
+                          )}
+                        </td>
+                        <td className="muted">{owners.length > 0 ? owners.join(', ') : 'unclaimed'}</td>
                         <td>
                           {!held && (
                             <button
@@ -452,11 +486,23 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
                 )}
 
                 <h3 className="sub">Known recipes</h3>
-                <div className="muted" style={{ padding: '0 4px' }}>
-                  {state.player.knowledge.knownRecipeIds.size === 0
-                    ? 'None yet — research to discover recipes.'
-                    : [...state.player.knowledge.knownRecipeIds].map((id) => resourceName(state.recipes.find((rc) => rc.id === id)?.output ?? id)).join(', ')}
-                </div>
+                {state.player.knowledge.knownRecipeIds.size === 0 ? (
+                  <div className="muted" style={{ padding: '0 4px' }}>None yet — research to discover recipes.</div>
+                ) : (
+                  <div className="btn-row" style={{ padding: '0 4px' }}>
+                    {[...state.player.knowledge.knownRecipeIds].map((id) => {
+                      const recipe = state.recipes.find((rc) => rc.id === id);
+                      const exclusive = recipe && recipe.exclusiveTurnsLeft !== undefined && recipe.exclusiveTurnsLeft > 0;
+                      return (
+                        <span key={id} className="known-recipe-chip">
+                          {resourceName(recipe?.output ?? id)}
+                          {exclusive && <span className="exclusive-badge">🔒 exclusive · {recipe!.exclusiveTurnsLeft} turns</span>}
+                          {!exclusive && recipe?.published && <span className="muted"> (public)</span>}
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
               </>
             )}
 
@@ -903,6 +949,31 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
                   <span>Legal team<span className="desc"> — 25g retainer per turn; fewer suspensions, better court odds</span></span>
                 </label>
                 <p className="hint">Safety is a tax on greed — every defense costs real profit.</p>
+              </>
+            )}
+
+            {tab === 'leaderboard' && (
+              <>
+                <table>
+                  <thead><tr><th className="num">Rank</th><th>Company</th><th className="num">Standing</th><th className="num">Reputation</th><th className="num">Licenses</th><th>Personality</th></tr></thead>
+                  <tbody>
+                    {leaderboard.map((entry, i) => (
+                      <tr key={entry.name} className={entry.isPlayer ? 'leaderboard-you' : undefined}>
+                        <td className="num">{i + 1}</td>
+                        <td className="resource-name">{entry.name}</td>
+                        <td className="num">{entry.standing}g</td>
+                        <td className="num">{Math.round(entry.reputation)}</td>
+                        <td className="num">{entry.licenses}</td>
+                        <td className="muted">{entry.personality ?? '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <p className="hint">
+                  Rivals in this simulation only track cash — no facilities or inventory — so "Standing" is your full net worth
+                  (cash + facilities + inventory − debt) versus their cash alone. Not perfectly apples-to-apples, but the best
+                  available comparison.
+                </p>
               </>
             )}
           </div>

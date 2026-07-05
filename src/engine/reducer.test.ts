@@ -5,6 +5,7 @@ import {
   applyCommand,
   effectiveCapacity,
   estimateBills,
+  grantDiscoveryLicense,
   ingredientResearchCost,
   levelUpCost,
   levelUpDuration,
@@ -241,6 +242,57 @@ describe('applyCommand — production & licensing', () => {
     expect(state.player.inventory['malt']?.qty ?? 0).toBe(0);
   });
 
+  // Regression coverage: yeast_culture used to have a facility ('lab') but no
+  // producing Recipe anywhere in the scenario config, so tryProduce's
+  // findRecipe() lookup could never succeed for it — making every tier-2
+  // beer/cider (all of which require yeast_culture) permanently unproducible.
+  // recipe_extract_yeast_culture (config.ts) closes that gap.
+  it('yeast_culture is producible once its extraction recipe is known and a lab is staffed', () => {
+    let state = newGame(breweryScenario, 1); // seed 1 fires no disruptive event in the first two ticks
+    state.player.licenses.push({ resourceId: 'yeast_culture', status: 'active', turnsUntilRenewal: 5, unitsProducedThisPeriod: 0 });
+    state.player.knowledge.knownRecipeIds.add('recipe_extract_yeast_culture');
+    state = applyCommand(state, { kind: 'buildFacility', facilityType: 'lab', resourceId: 'yeast_culture' }, breweryScenario);
+    const lab = state.player.facilities.find((f) => f.type === 'lab')!;
+    state = applyCommand(state, { kind: 'hireFire', facilityId: lab.id, targetWorkers: lab.requiredWorkers }, breweryScenario);
+    // Isolate the manual produce command from auto-production's own claim on capacity.
+    state = applyCommand(state, { kind: 'toggleAutoProduce', resourceId: 'yeast_culture', on: false }, breweryScenario);
+    for (let i = 0; i < 2; i++) state = tick(state, breweryScenario); // lab buildTurns is 2
+    expect(state.player.facilities.find((f) => f.type === 'lab')!.buildTurnsLeft).toBe(0);
+    state = applyCommand(state, { kind: 'produce', resourceId: 'yeast_culture', qty: 5 }, breweryScenario);
+    expect(state.player.inventory['yeast_culture']?.qty ?? 0).toBe(5);
+  });
+
+  it("recipe_keg_beer's full ingredient chain (malt + hops + yeast_culture) can actually complete end-to-end", () => {
+    let state = newGame(breweryScenario, 3);
+    state.player.cash = 2_000_000; // headroom for facility builds/upkeep across many ticks
+    state.player.licenseSlots = 10;
+
+    // Bypass the RNG-driven discovery ladder (covered by the "research ladder"
+    // and "discovery disclosure" tests above) to isolate production mechanics:
+    // does the chain actually assemble and produce keg_beer once everything is known?
+    for (const id of ['recipe_extract_hops', 'recipe_malt', 'recipe_extract_yeast_culture', 'recipe_keg_beer']) {
+      state.player.knowledge.knownRecipeIds.add(id);
+    }
+    // turnsUntilRenewal set well beyond the tick window so keg_beer's license
+    // quota check doesn't fire before the brewery has even finished building.
+    for (const resourceId of ['hops', 'malt', 'yeast_culture', 'keg_beer']) {
+      state.player.licenses.push({ resourceId, status: 'active', turnsUntilRenewal: 100, unitsProducedThisPeriod: 0 });
+    }
+
+    state = applyCommand(state, { kind: 'buildFacility', facilityType: 'farm', resourceId: 'hops' }, breweryScenario);
+    state = applyCommand(state, { kind: 'buildFacility', facilityType: 'malthouse', resourceId: 'malt' }, breweryScenario);
+    state = applyCommand(state, { kind: 'buildFacility', facilityType: 'lab', resourceId: 'yeast_culture' }, breweryScenario);
+    state = applyCommand(state, { kind: 'buildFacility', facilityType: 'brewery', resourceId: 'keg_beer' }, breweryScenario);
+    for (const f of state.player.facilities) {
+      state = applyCommand(state, { kind: 'hireFire', facilityId: f.id, targetWorkers: f.requiredWorkers }, breweryScenario);
+    }
+
+    for (let i = 0; i < 30; i++) state = tick(state, breweryScenario);
+
+    expect(state.ledger.some((e) => e.label.startsWith('Extracted') && e.label.endsWith('yeast_culture'))).toBe(true);
+    expect(state.player.inventory['keg_beer']?.qty ?? 0).toBeGreaterThan(0);
+  });
+
 });
 
 describe('facility dedication & leveling', () => {
@@ -379,12 +431,12 @@ describe('applyCommand — research ladder', () => {
     expect(state.player.cash).toBe(cashBefore - breweryScenario.researchCost);
   });
 
-  it('ingredient-directed research charges tier × 100, not the flat breakthrough cost', () => {
+  it('ingredient-directed research charges tier × 200, not the flat breakthrough cost', () => {
     let state = newGame(breweryScenario, 6);
     const cashBefore = state.player.cash;
     state = applyCommand(state, { kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 1 }, breweryScenario);
     expect(state.player.cash).toBe(cashBefore - ingredientResearchCost(1));
-    expect(ingredientResearchCost(1)).toBe(100);
+    expect(ingredientResearchCost(1)).toBe(200);
   });
 
   it('ingredient-directed research cost scales with the targeted tier', () => {
@@ -392,7 +444,7 @@ describe('applyCommand — research ladder', () => {
     state.player.cash = 10000;
     const cashBefore = state.player.cash;
     state = applyCommand(state, { kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 3 }, breweryScenario);
-    expect(state.player.cash).toBe(cashBefore - 300);
+    expect(state.player.cash).toBe(cashBefore - 600);
     expect(state.player.knowledge.activeCommission?.targetTier).toBe(3);
   });
 
@@ -485,11 +537,50 @@ describe('discovery disclosure', () => {
     return state;
   }
 
-  it('queues a pending disclosure for the newly discovered recipe', () => {
+  // recipe_bottled_beer sits at the end of a deep chain (needs keg_beer,
+  // which itself needs malt+hops+yeast_culture, none of which rivals start
+  // knowing) — reaching it via rivals' own background research would require
+  // several independent lucky rolls to land in the right order. Not
+  // mathematically impossible like some shallower recipes, but negligible
+  // within the ~30-tick window this fixture is used for (verified empirically
+  // for the seed below). Used where a test runs many ticks and needs a target
+  // that won't incidentally get "discovered" by a rival's own research,
+  // isolating "did disclosure choice X publish it" from "did a rival
+  // separately discover it on their own" (a different, valid path now that
+  // rivals research too).
+  function withPendingBottledBeerDisclosure(seed: number) {
+    const state = newGame(breweryScenario, seed);
+    state.player.knowledge.knownRecipeIds.add('recipe_bottled_beer');
+    state.pendingDisclosures.push({ recipeId: 'recipe_bottled_beer' });
+    return state;
+  }
+
+  it('queues a pending disclosure exactly when the newly discovered recipe starts unpublished', () => {
+    // Blind research can land on any reachable recipe, including recipe_malt
+    // (published from turn 1) — assert against the discovered recipe's own
+    // published flag rather than assuming which one gets picked, so this
+    // isn't tied to one seed's exact RNG draw.
+    let state = newGame(breweryScenario, 4);
+    state = step(state, [{ kind: 'researchBlind' }]);
+    state = step(state);
+    state = step(state);
+    const discoveredId = [...state.player.knowledge.knownRecipeIds].find((id) => id !== 'recipe_extract_barley')!;
+    expect(discoveredId).toBeDefined();
+    const discoveredRecipe = state.recipes.find((r) => r.id === discoveredId)!;
+    if (discoveredRecipe.published) {
+      expect(state.pendingDisclosures).toHaveLength(0);
+    } else {
+      expect(state.pendingDisclosures).toHaveLength(1);
+      expect(state.pendingDisclosures[0].recipeId).toBe(discoveredId);
+    }
+  });
+
+  it('does not queue a disclosure for a recipe that is already published', () => {
+    // recipe_malt starts published: true in the scenario config — rivals
+    // already know it from turn 1, so there's no real disclosure choice.
     const state = discoverMalt(6);
     expect(state.player.knowledge.knownRecipeIds.has('recipe_malt')).toBe(true);
-    expect(state.pendingDisclosures).toHaveLength(1);
-    expect(state.pendingDisclosures[0].recipeId).toBe('recipe_malt');
+    expect(state.pendingDisclosures).toHaveLength(0);
   });
 
   it('"free" publishes the recipe to every rival immediately', () => {
@@ -502,21 +593,21 @@ describe('discovery disclosure', () => {
   });
 
   it('"exclusive" keeps it private for 30 minutes, then auto-publishes', () => {
-    let state = withPendingHopsDisclosure(6);
+    let state = withPendingBottledBeerDisclosure(6);
     state = applyCommand(state, { kind: 'resolveDisclosure', choice: 'exclusive' }, breweryScenario);
-    let recipe = state.recipes.find((r) => r.id === 'recipe_extract_hops')!;
+    let recipe = state.recipes.find((r) => r.id === 'recipe_bottled_beer')!;
     expect(recipe.exclusiveTurnsLeft).toBe(30);
-    for (const rival of state.rivals) expect(rival.knownRecipeIds.has('recipe_extract_hops')).toBe(false);
+    for (const rival of state.rivals) expect(rival.knownRecipeIds.has('recipe_bottled_beer')).toBe(false);
 
     for (let i = 0; i < 29; i++) state = tick(state, breweryScenario);
-    recipe = state.recipes.find((r) => r.id === 'recipe_extract_hops')!;
+    recipe = state.recipes.find((r) => r.id === 'recipe_bottled_beer')!;
     expect(recipe.published).toBe(false);
-    for (const rival of state.rivals) expect(rival.knownRecipeIds.has('recipe_extract_hops')).toBe(false);
+    for (const rival of state.rivals) expect(rival.knownRecipeIds.has('recipe_bottled_beer')).toBe(false);
 
     state = tick(state, breweryScenario); // 30th tick — timer lapses
-    recipe = state.recipes.find((r) => r.id === 'recipe_extract_hops')!;
+    recipe = state.recipes.find((r) => r.id === 'recipe_bottled_beer')!;
     expect(recipe.published).toBe(true);
-    for (const rival of state.rivals) expect(rival.knownRecipeIds.has('recipe_extract_hops')).toBe(true);
+    for (const rival of state.rivals) expect(rival.knownRecipeIds.has('recipe_bottled_beer')).toBe(true);
   });
 
   it('"sell" pays the player, teaches only the buyer, and keeps it unpublished', () => {
@@ -540,6 +631,65 @@ describe('discovery disclosure', () => {
     expect(state.pendingDisclosures).toHaveLength(0);
     const next = applyCommand(state, { kind: 'resolveDisclosure', choice: 'free' }, breweryScenario);
     expect(next.pendingDisclosures).toHaveLength(0);
+  });
+});
+
+describe('discovery grants ownership', () => {
+  it('discovering a recipe grants its license for free, no purchase needed', () => {
+    let state = newGame(breweryScenario, 4);
+    state.player.licenseSlots = 2; // room for the discovery grant alongside the starting Barley license
+    state = step(state, [{ kind: 'researchBlind' }]);
+    state = step(state);
+    state = step(state);
+    const discoveredId = [...state.player.knowledge.knownRecipeIds].find((id) => id !== 'recipe_extract_barley')!;
+    const discoveredRecipe = state.recipes.find((r) => r.id === discoveredId)!;
+    expect(state.player.licenses.some((l) => l.resourceId === discoveredRecipe.output)).toBe(true);
+    const grantEntry = state.ledger.filter((e) => e.label.includes('discovery reward'));
+    expect(grantEntry).toHaveLength(1);
+    expect(grantEntry[0].delta).toBe(0); // free — no cash change from the grant itself
+  });
+
+  it('does not grant a duplicate license if the discoverer already holds one for that resource', () => {
+    // recipe_extract_barley's output is 'barley', which the player already
+    // holds a license for from game start.
+    const state = newGame(breweryScenario, 4);
+    expect(state.player.licenses.filter((l) => l.resourceId === 'barley')).toHaveLength(1);
+  });
+
+  it('does not grant a license when the discoverer has no free license slot', () => {
+    let state = newGame(breweryScenario, 4);
+    state.player.licenseSlots = 1; // already at cap with the starting Barley license
+    state = step(state, [{ kind: 'researchBlind' }]);
+    state = step(state);
+    state = step(state);
+    const discoveredId = [...state.player.knowledge.knownRecipeIds].find((id) => id !== 'recipe_extract_barley')!;
+    const discoveredRecipe = state.recipes.find((r) => r.id === discoveredId)!;
+    // Still learned the recipe...
+    expect(state.player.knowledge.knownRecipeIds.has(discoveredId)).toBe(true);
+    // ...but no license was granted since there was no room.
+    expect(state.player.licenses).toHaveLength(1);
+    expect(state.player.licenses.some((l) => l.resourceId === discoveredRecipe.output)).toBe(false);
+  });
+
+  it('grantDiscoveryLicense has no cross-company exclusivity — independent discoverers each get their own license', () => {
+    const scenario = breweryScenario;
+    const rice = 'rice';
+    const playerLicenses = grantDiscoveryLicense([], 5, rice, scenario);
+    const rivalLicenses = grantDiscoveryLicense([], 5, rice, scenario);
+    // Both succeed independently — one company's grant doesn't block another's.
+    expect(playerLicenses.some((l) => l.resourceId === rice)).toBe(true);
+    expect(rivalLicenses.some((l) => l.resourceId === rice)).toBe(true);
+  });
+
+  it('rivals eventually discover new recipes and license themselves via background research', () => {
+    let state = newGame(breweryScenario, 7);
+    const startingKnownSize = state.rivals[0].knownRecipeIds.size;
+    for (let i = 0; i < 60 && state.rivals[0].knownRecipeIds.size === startingKnownSize; i++) {
+      state = tick(state, breweryScenario);
+    }
+    expect(state.rivals[0].knownRecipeIds.size).toBeGreaterThan(startingKnownSize);
+    const discoveryEntries = state.ledger.filter((e) => e.label.includes(`${state.rivals[0].name} discovered`));
+    expect(discoveryEntries.length).toBeGreaterThan(0);
   });
 });
 
@@ -913,7 +1063,7 @@ describe('license renewal affordability', () => {
   });
 
   it('retries the renewal once cash recovers, and clears the suspension on success', () => {
-    let state = newGame(breweryScenario, 5);
+    let state = newGame(breweryScenario, 1);
     state.player.facilities = [];
     const def = breweryScenario.licenses.find((l) => l.resourceId === 'barley')!;
     state.player.licenses[0].turnsUntilRenewal = 1;

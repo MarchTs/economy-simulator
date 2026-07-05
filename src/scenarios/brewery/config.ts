@@ -77,6 +77,7 @@ const extractionRecipes: Recipe[] = [
   { id: 'recipe_extract_apple', output: 'apple', outputQty: 1, facility: 'farm', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_silica_sand', output: 'silica_sand', outputQty: 1, facility: 'quarry', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_aluminum_ore', output: 'aluminum_ore', outputQty: 1, facility: 'quarry', inputs: [], published: false, communityLevel: 0 },
+  { id: 'recipe_extract_yeast_culture', output: 'yeast_culture', outputQty: 1, facility: 'lab', inputs: [], published: false, communityLevel: 0 },
 ];
 
 const recipes: Recipe[] = [
@@ -206,9 +207,6 @@ const recipes: Recipe[] = [
   },
 ];
 
-// Note: yeast_culture has a facility ('lab') but no recipe — produced from
-// nothing but carries a contamination event risk (§2.5), modeled as a disaster.
-
 const licenses: LicenseDef[] = [
   { resourceId: 'barley', class: 'open', upfrontCost: 50, renewalCost: 10, renewalPeriod: 5, minReputation: 0 },
   { resourceId: 'hops', class: 'open', upfrontCost: 60, renewalCost: 12, renewalPeriod: 5, minReputation: 0 },
@@ -291,5 +289,5 @@ export const breweryScenario: ScenarioConfig = {
   startingFacility: { type: 'farm' },
   startingLicenseResourceId: ['barley'],
   startingKnownRecipeIds: ['recipe_extract_barley'],
-  researchCost: 80,
+  researchCost: 160,
 };

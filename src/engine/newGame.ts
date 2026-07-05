@@ -45,6 +45,8 @@ const RIVAL_NAMES: { name: string; personality: RivalCompany['personality'] }[] 
   { name: 'Heritage Brewers', personality: 'premium' },
 ];
 
+const RIVAL_LICENSE_SLOTS = 3;
+
 // Rivals start selling whatever the scenario's first publicly-known recipe
 // makes (Brewery: Malt; Bakery: Flour) — scenario-driven so this isn't
 // hardcoded to one industry's output.
@@ -52,6 +54,18 @@ function makeRivals(scenario: ScenarioConfig): RivalCompany[] {
   const publishedRecipes = scenario.recipes.filter((rc) => rc.published);
   const flagshipResourceId = publishedRecipes[0]?.output ?? scenario.resources[0].id;
   const flagshipResource = scenario.resources.find((r) => r.id === flagshipResourceId)!;
+
+  // Also seed the tier-0 extraction recipes behind whatever rivals already
+  // make (e.g. Malt needs Barley) so their own background research (see
+  // runRivalResearch in reducer.ts) has real precursor knowledge to climb
+  // from, instead of starting permanently stuck with nothing left to reach.
+  const baseKnownIds = new Set(publishedRecipes.map((rc) => rc.id));
+  for (const r of publishedRecipes) {
+    for (const input of r.inputs) {
+      const producer = scenario.recipes.find((rc) => rc.output === input.ingredientId);
+      if (producer) baseKnownIds.add(producer.id);
+    }
+  }
 
   return RIVAL_NAMES.map((r, i) => ({
     id: `rival_${i + 1}`,
@@ -62,7 +76,8 @@ function makeRivals(scenario: ScenarioConfig): RivalCompany[] {
     licenses: [
       { resourceId: flagshipResourceId, status: 'active', turnsUntilRenewal: 5, unitsProducedThisPeriod: 0 },
     ],
-    knownRecipeIds: new Set(publishedRecipes.map((rc) => rc.id)),
+    licenseSlots: RIVAL_LICENSE_SLOTS,
+    knownRecipeIds: new Set(baseKnownIds),
     postedPrices: { [flagshipResourceId]: flagshipResource.basePrice },
     unitCost: { [flagshipResourceId]: Math.round(flagshipResource.basePrice * 0.75) },
     cumulativeLoss: {},

@@ -171,6 +171,7 @@ export interface RivalCompany {
   cash: number;
   reputation: number;
   licenses: HeldLicense[];
+  licenseSlots: number;
   knownRecipeIds: Set<string>;
   postedPrices: Record<ResourceId, number>;
   unitCost: Record<ResourceId, number>;

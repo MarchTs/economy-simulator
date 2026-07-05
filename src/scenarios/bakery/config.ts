@@ -225,5 +225,5 @@ export const bakeryScenario: ScenarioConfig = {
   startingFacility: { type: 'farm' },
   startingLicenseResourceId: ['wheat'],
   startingKnownRecipeIds: ['recipe_extract_wheat'],
-  researchCost: 40,
+  researchCost: 80,
 };

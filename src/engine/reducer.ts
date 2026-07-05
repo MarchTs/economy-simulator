@@ -11,6 +11,7 @@ import type {
   Facility,
   FacilityId,
   GameState,
+  HeldLicense,
   LedgerEntry,
   Loan,
   QuestContract,
@@ -29,7 +30,7 @@ const RENEWAL_FAILURE_SUSPENSION_TURNS = 3; // per doc §3's "2-3 turns" suspens
 // Ingredient-directed research targets a specific tier, so it's priced
 // steeper than the flat, random-outcome Breakthrough (scenario.researchCost) —
 // paying for precision.
-export const INGREDIENT_RESEARCH_COST_PER_TIER = 100;
+export const INGREDIENT_RESEARCH_COST_PER_TIER = 200;
 export function ingredientResearchCost(targetTier: number): number {
   return targetTier * INGREDIENT_RESEARCH_COST_PER_TIER;
 }
@@ -59,6 +60,26 @@ function licenseDefById(scenario: ScenarioConfig, id: string) {
 
 function facilityTypeDef(scenario: ScenarioConfig, type: string) {
   return scenario.facilityTypes.find((f) => f.type === type)!;
+}
+
+// Whoever discovers a recipe owns its license — for free, no purchase step.
+// This is deliberately non-exclusive: it only checks the discoverer's OWN
+// licenses/slots, so if the player and a rival happen to discover the same
+// recipe (even the same turn), each gets their own grant independently —
+// ownership "splits" between simultaneous discoverers rather than one
+// blocking the other. Returns the same array reference if nothing changed
+// (already held, or no free slot), so callers can check `!== licenses` to
+// know whether a grant actually happened.
+export function grantDiscoveryLicense(
+  licenses: HeldLicense[],
+  licenseSlots: number,
+  resourceId: ResourceId,
+  scenario: ScenarioConfig
+): HeldLicense[] {
+  if (licenses.some((l) => l.resourceId === resourceId)) return licenses;
+  if (licenses.length >= licenseSlots) return licenses;
+  const def = licenseDefById(scenario, resourceId);
+  return [...licenses, { resourceId, status: 'active', turnsUntilRenewal: def.renewalPeriod, unitsProducedThisPeriod: 0 }];
 }
 
 function assetValue(player: CompanyState, scenario: ScenarioConfig): number {
@@ -460,11 +481,63 @@ function runResearchProgress(state: GameState, scenario: ScenarioConfig) {
     known.add(chosen.id);
     if (!chosen.firstDiscoveredTurn) chosen.firstDiscoveredTurn = state.turn;
     addLedger(state.ledger, state.turn, `Research discovered: ${chosen.output}`, 0, player.cash);
-    state.pendingDisclosures.push({ recipeId: chosen.id });
+    // A recipe that's already published (e.g. Malt) is common industry
+    // knowledge rivals had from turn 1 — there's no real disclosure choice to
+    // make (exclusivity was never actually possible), so don't offer one.
+    if (!chosen.published) {
+      state.pendingDisclosures.push({ recipeId: chosen.id });
+    }
+    // Discovering it means owning it — a free license grant, not just
+    // knowledge. Skipped only if already held or out of license slots.
+    const grantedLicenses = grantDiscoveryLicense(player.licenses, player.licenseSlots, chosen.output, scenario);
+    if (grantedLicenses !== player.licenses) {
+      player.licenses = grantedLicenses;
+      addLedger(state.ledger, state.turn, `License granted (discovery reward): ${chosen.output}`, 0, player.cash);
+    }
   } else {
     addLedger(state.ledger, state.turn, 'Research found nothing new', 0, player.cash);
   }
   player.knowledge.activeCommission = undefined;
+}
+
+// Rivals do their own background research — the same "climb the tree by
+// ingredient" algorithm as the player's blind Breakthrough, rolled
+// independently per rival each turn. This is what makes "discover it, own
+// it" a real race rather than a player-only mechanic: a rival can discover
+// (and get auto-licensed for) the same recipe the player is chasing, on the
+// same turn or a different one — grantDiscoveryLicense has no cross-company
+// exclusivity, so simultaneous discovery just means both end up licensed.
+const RIVAL_RESEARCH_CHANCE = 0.15;
+
+function runRivalResearch(state: GameState, scenario: ScenarioConfig) {
+  for (const rival of state.rivals) {
+    const isResourceKnown = (rid: string) => state.recipes.some((r) => r.output === rid && rival.knownRecipeIds.has(r.id));
+    const candidates = state.recipes.filter(
+      (r) => !rival.knownRecipeIds.has(r.id) && r.inputs.every((i) => isResourceKnown(i.ingredientId))
+    );
+    if (candidates.length === 0) continue;
+
+    const roll = nextRandom(state.rngState);
+    state.rngState = roll.nextState;
+    if (roll.value > RIVAL_RESEARCH_CHANCE) continue;
+
+    const pick = nextRandom(state.rngState);
+    state.rngState = pick.nextState;
+    const chosen = candidates[Math.floor(pick.value * candidates.length)];
+    rival.knownRecipeIds.add(chosen.id);
+    if (!chosen.firstDiscoveredTurn) chosen.firstDiscoveredTurn = state.turn;
+
+    const grantedLicenses = grantDiscoveryLicense(rival.licenses, rival.licenseSlots, chosen.output, scenario);
+    const gotLicense = grantedLicenses !== rival.licenses;
+    rival.licenses = grantedLicenses;
+    addLedger(
+      state.ledger,
+      state.turn,
+      `${rival.name} discovered${gotLicense ? ' and licensed' : ''}: ${chosen.output}`,
+      0,
+      state.player.cash
+    );
+  }
 }
 
 // A recipe's exclusivity window ("stay exclusive for 30 minutes") ticks down
@@ -623,6 +696,7 @@ export function tick(prevState: GameState, scenario: ScenarioConfig): GameState 
   runContractBoard(state, scenario);
   runAutoProduction(state, scenario);
   runResearchProgress(state, scenario);
+  runRivalResearch(state, scenario);
   runExclusivityClock(state);
   runSupplyContracts(state);
   runLoanPayments(state);
