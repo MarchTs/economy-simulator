@@ -246,11 +246,14 @@ describe('applyCommand — production & licensing', () => {
   // producing Recipe anywhere in the scenario config, so tryProduce's
   // findRecipe() lookup could never succeed for it — making every tier-2
   // beer/cider (all of which require yeast_culture) permanently unproducible.
-  // recipe_extract_yeast_culture (config.ts) closes that gap.
-  it('yeast_culture is producible once its extraction recipe is known and a lab is staffed', () => {
+  // recipe_yeast_culture (config.ts) closes that gap — it consumes Barley
+  // (propagated on a grain-based nutrient medium) rather than being a bare
+  // extraction, consistent with every other tier-1 processed good.
+  it('yeast_culture is producible once its recipe is known, a lab is staffed, and barley is on hand', () => {
     let state = newGame(breweryScenario, 1); // seed 1 fires no disruptive event in the first two ticks
     state.player.licenses.push({ resourceId: 'yeast_culture', status: 'active', turnsUntilRenewal: 5, unitsProducedThisPeriod: 0 });
-    state.player.knowledge.knownRecipeIds.add('recipe_extract_yeast_culture');
+    state.player.knowledge.knownRecipeIds.add('recipe_yeast_culture');
+    state.player.inventory['barley'] = { qty: 10, ageTurns: 0 };
     state = applyCommand(state, { kind: 'buildFacility', facilityType: 'lab', resourceId: 'yeast_culture' }, breweryScenario);
     const lab = state.player.facilities.find((f) => f.type === 'lab')!;
     state = applyCommand(state, { kind: 'hireFire', facilityId: lab.id, targetWorkers: lab.requiredWorkers }, breweryScenario);
@@ -270,7 +273,7 @@ describe('applyCommand — production & licensing', () => {
     // Bypass the RNG-driven discovery ladder (covered by the "research ladder"
     // and "discovery disclosure" tests above) to isolate production mechanics:
     // does the chain actually assemble and produce keg_beer once everything is known?
-    for (const id of ['recipe_extract_hops', 'recipe_malt', 'recipe_extract_yeast_culture', 'recipe_keg_beer']) {
+    for (const id of ['recipe_extract_hops', 'recipe_malt', 'recipe_yeast_culture', 'recipe_keg_beer']) {
       state.player.knowledge.knownRecipeIds.add(id);
     }
     // turnsUntilRenewal set well beyond the tick window so keg_beer's license
@@ -289,7 +292,7 @@ describe('applyCommand — production & licensing', () => {
 
     for (let i = 0; i < 30; i++) state = tick(state, breweryScenario);
 
-    expect(state.ledger.some((e) => e.label.startsWith('Extracted') && e.label.endsWith('yeast_culture'))).toBe(true);
+    expect(state.ledger.some((e) => e.label.startsWith('Produced') && e.label.endsWith('yeast_culture'))).toBe(true);
     expect(state.player.inventory['keg_beer']?.qty ?? 0).toBeGreaterThan(0);
   });
 
@@ -409,11 +412,17 @@ describe('applyCommand — research ladder', () => {
   });
 
   it('ingredient-directed research discovers a recipe built from the chosen ingredients', () => {
+    // Both recipe_malt and recipe_yeast_culture are valid tier-1 candidates
+    // buildable from barley alone — assert on the discovered recipe's own
+    // inputs rather than assuming which one the RNG lands on.
     let state = newGame(breweryScenario, 6);
     state = step(state, [{ kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 1 }]);
     state = step(state);
     state = step(state);
-    expect(state.player.knowledge.knownRecipeIds.has('recipe_malt')).toBe(true);
+    const discoveredId = [...state.player.knowledge.knownRecipeIds].find((id) => id !== 'recipe_extract_barley');
+    expect(discoveredId).toBeDefined();
+    const discoveredRecipe = state.recipes.find((r) => r.id === discoveredId)!;
+    expect(discoveredRecipe.inputs.every((i) => i.ingredientId === 'barley')).toBe(true);
   });
 
   it('ingredient-directed research will not discover a recipe needing unselected ingredients', () => {
@@ -528,7 +537,10 @@ describe('applyCommand — research ladder', () => {
 });
 
 describe('discovery disclosure', () => {
-  function discoverMalt(seed: number) {
+  // Lands on whichever of recipe_malt / recipe_yeast_culture the RNG picks —
+  // both are valid tier-1-from-barley candidates and both start published,
+  // which is exactly what this fixture needs (see the test below).
+  function discoverPublishedTier1FromBarley(seed: number) {
     let state = newGame(breweryScenario, seed);
     state = step(state, [{ kind: 'researchByIngredients', ingredients: ['barley'], targetTier: 1 }]);
     state = step(state);
@@ -585,10 +597,14 @@ describe('discovery disclosure', () => {
   });
 
   it('does not queue a disclosure for a recipe that is already published', () => {
-    // recipe_malt starts published: true in the scenario config — rivals
-    // already know it from turn 1, so there's no real disclosure choice.
-    const state = discoverMalt(6);
-    expect(state.player.knowledge.knownRecipeIds.has('recipe_malt')).toBe(true);
+    // Both recipe_malt and recipe_yeast_culture start published: true —
+    // rivals already know either from turn 1, so there's no real disclosure
+    // choice regardless of which one the RNG lands on.
+    const state = discoverPublishedTier1FromBarley(6);
+    const discoveredId = [...state.player.knowledge.knownRecipeIds].find((id) => id !== 'recipe_extract_barley');
+    expect(discoveredId).toBeDefined();
+    const discoveredRecipe = state.recipes.find((r) => r.id === discoveredId)!;
+    expect(discoveredRecipe.published).toBe(true);
     expect(state.pendingDisclosures).toHaveLength(0);
   });
 

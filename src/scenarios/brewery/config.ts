@@ -89,6 +89,14 @@ const resources: Resource[] = [
     facility: 'distillery',
     shelfLifeTurns: 24, // distilled spirits keep far longer than beer/wine/cider
   },
+  {
+    id: 'whiskey',
+    name: 'Whiskey',
+    tier: 3,
+    basePrice: 260,
+    facility: 'distillery',
+    shelfLifeTurns: 24,
+  },
 ];
 
 // Tier-0 "extraction recipes": no inputs, unlocked by research/discovery.
@@ -102,7 +110,6 @@ const extractionRecipes: Recipe[] = [
   { id: 'recipe_extract_grape', output: 'grape', outputQty: 1, facility: 'farm', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_silica_sand', output: 'silica_sand', outputQty: 1, facility: 'quarry', inputs: [], published: false, communityLevel: 0 },
   { id: 'recipe_extract_aluminum_ore', output: 'aluminum_ore', outputQty: 1, facility: 'quarry', inputs: [], published: false, communityLevel: 0 },
-  { id: 'recipe_extract_yeast_culture', output: 'yeast_culture', outputQty: 1, facility: 'lab', inputs: [], published: false, communityLevel: 0 },
 ];
 
 const recipes: Recipe[] = [
@@ -113,6 +120,19 @@ const recipes: Recipe[] = [
     outputQty: 1,
     facility: 'malthouse',
     inputs: [{ ingredientId: 'barley', qty: 2 }],
+    published: true,
+    communityLevel: 0,
+  },
+  {
+    // Yeast is propagated on a barley-based nutrient medium — unlike the
+    // tier-0 extraction recipes above, this genuinely consumes an ingredient
+    // rather than being harvested for free, consistent with every other
+    // tier-1 processed good (Malt, Wheat Malt, Glass Bottle, Aluminum Can).
+    id: 'recipe_yeast_culture',
+    output: 'yeast_culture',
+    outputQty: 1,
+    facility: 'lab',
+    inputs: [{ ingredientId: 'barley', qty: 1 }],
     published: true,
     communityLevel: 0,
   },
@@ -266,6 +286,17 @@ const recipes: Recipe[] = [
     published: false,
     communityLevel: 0,
   },
+  {
+    // Whiskey is distilled from an already-brewed malt beer, same distillery
+    // as Vodka — the facility handles more than one spirit.
+    id: 'recipe_whiskey',
+    output: 'whiskey',
+    outputQty: 1,
+    facility: 'distillery',
+    inputs: [{ ingredientId: 'keg_beer', qty: 2 }],
+    published: false,
+    communityLevel: 0,
+  },
 ];
 
 const licenses: LicenseDef[] = [
@@ -339,6 +370,7 @@ const licenses: LicenseDef[] = [
   { resourceId: 'bottled_cider', class: 'closed', upfrontCost: 700, renewalCost: 90, renewalPeriod: 5, minReputation: 25 },
   { resourceId: 'bottled_wine', class: 'closed', upfrontCost: 850, renewalCost: 110, renewalPeriod: 5, minReputation: 30 },
   { resourceId: 'vodka', class: 'closed', upfrontCost: 1200, renewalCost: 150, renewalPeriod: 5, minReputation: 40 },
+  { resourceId: 'whiskey', class: 'closed', upfrontCost: 1400, renewalCost: 170, renewalPeriod: 5, minReputation: 45 },
 ];
 
 const facilityTypes: FacilityTypeDef[] = [
