@@ -23,6 +23,7 @@ import { bakeryScenario } from './scenarios/bakery/config';
 import { breweryScenario } from './scenarios/brewery/config';
 import type { ScenarioConfig } from './scenarios/types';
 import { MarketIntelView, type MarketIntel } from './ui/MarketIntelView';
+import { PriceChart } from './ui/PriceChart';
 import { RecipeTreeView } from './ui/RecipeTreeView';
 
 const SCENARIOS: { config: ScenarioConfig; blurb: string }[] = [
@@ -31,7 +32,7 @@ const SCENARIOS: { config: ScenarioConfig; blurb: string }[] = [
 ];
 const SEED = 1234;
 
-type Tab = 'licenses' | 'research' | 'facilities' | 'contracts' | 'bank' | 'payments' | 'defenses' | 'leaderboard';
+type Tab = 'licenses' | 'research' | 'facilities' | 'contracts' | 'bank' | 'payments' | 'defenses' | 'leaderboard' | 'log';
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'licenses', label: 'Licenses' },
@@ -42,6 +43,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'payments', label: 'Payments' },
   { id: 'defenses', label: 'Defenses' },
   { id: 'leaderboard', label: 'Leaderboard' },
+  { id: 'log', label: 'Log' },
 ];
 
 function App() {
@@ -98,6 +100,8 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
     return { facilityType, resourceId };
   });
   const [borrowAmount, setBorrowAmount] = useState(500);
+  const [goldQty, setGoldQty] = useState(1);
+  const [logFilter, setLogFilter] = useState('');
 
   const [prevPrices, setPrevPrices] = useState<Record<string, number>>({});
   const [flash, setFlash] = useState<string[]>([]); // recent event log lines
@@ -108,6 +112,7 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
   function endTurn() {
     const snap: Record<string, number> = {};
     for (const [id, e] of Object.entries(state.market)) snap[id] = e.price;
+    snap.__gold__ = state.goldPrice;
     setPrevPrices(snap);
     setState((cur) => (cur.gameOver ? cur : tick(cur, scenario)));
   }
@@ -117,12 +122,12 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
     const fresh = state.ledger.slice(ledgerSeen.current);
     ledgerSeen.current = state.ledger.length;
     const interesting = fresh
-      .filter((e) => /discovered|granted|Spoiled|breach|lawsuit|Quest|suspend|lapsed|fire|spike|flood|failure/i.test(e.label))
+      .filter((e) => /discovered|granted|Spoiled|breach|lawsuit|Quest|suspend|lapsed|fire|spike|flood|failure|Gold rally|Gold crash/i.test(e.label))
       .map((e) => e.label);
     if (interesting.length) setFlash((f) => [...interesting, ...f].slice(0, 4));
   }, [state.ledger]);
 
-  const netWorth = useMemo(() => {
+  const netWorthBreakdown = useMemo(() => {
     const facilityValue = state.player.facilities.reduce((sum, f) => {
       const def = scenario.facilityTypes.find((d) => d.type === f.type)!;
       return sum + def.buildCost * (f.condition / 100);
@@ -131,8 +136,12 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
       const r = scenario.resources.find((res) => res.id === id);
       return sum + (r ? r.basePrice * e.qty : 0);
     }, 0);
-    return Math.round(state.player.cash + facilityValue + invValue - outstandingDebt(state.player));
+    const goldValue = state.player.goldHeld * state.goldPrice;
+    const debt = outstandingDebt(state.player);
+    const total = Math.round(state.player.cash + facilityValue + invValue + goldValue - debt);
+    return { cash: state.player.cash, facilityValue, invValue, goldValue, debt, total };
   }, [state]);
+  const netWorth = netWorthBreakdown.total;
 
   const leaderboard = useMemo(() => {
     // Rivals in this engine only track cash (no facilities/inventory model),
@@ -166,6 +175,8 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
     return {
       resourceId: id,
       resourceName: resourceName(id),
+      priceHistory: state.market[id].priceHistory,
+      currentTurn: state.turn,
       boardQuests: state.contractBoard.filter((o) => o.resourceId === id),
       boardStanding: state.standingOfferBoard.filter((o) => o.resourceId === id),
       myQuests: state.player.questContracts.filter((c) => c.resourceId === id),
@@ -266,7 +277,18 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
           <small>{scenario.name.toUpperCase()} · Turn {state.turn} / 60</small>
         </div>
         <div className="stat"><span className="label">Cash</span><span className="value">{Math.round(state.player.cash)}g</span></div>
-        <div className="stat"><span className="label">Net worth</span><span className="value">{netWorth}g</span></div>
+        <div className="stat net-worth-stat">
+          <span className="label">Net worth</span>
+          <span className="value">{netWorth}g</span>
+          <div className="net-worth-tooltip">
+            <div className="tooltip-row"><span>Cash</span><span>{Math.round(netWorthBreakdown.cash)}g</span></div>
+            <div className="tooltip-row"><span>Facilities <em>(at condition)</em></span><span>{Math.round(netWorthBreakdown.facilityValue)}g</span></div>
+            <div className="tooltip-row"><span>Inventory</span><span>{Math.round(netWorthBreakdown.invValue)}g</span></div>
+            <div className="tooltip-row"><span>Gold holdings</span><span>{Math.round(netWorthBreakdown.goldValue)}g</span></div>
+            <div className="tooltip-row"><span>− Outstanding debt</span><span>{Math.round(netWorthBreakdown.debt)}g</span></div>
+            <div className="tooltip-row total"><span>Net worth</span><span>{netWorth}g</span></div>
+          </div>
+        </div>
         <div className="stat"><span className="label">Reputation</span><span className="value">{Math.round(state.player.reputation)}</span></div>
         <div className="stat"><span className="label">Licenses</span><span className="value">{state.player.licenses.length}/{state.player.licenseSlots}</span></div>
 
@@ -812,6 +834,47 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
                     Borrow
                   </button>
                 </div>
+
+                <h3 className="sub">Gold</h3>
+                <p className="hint" style={{ margin: '0 4px 8px' }}>
+                  A speculative asset, not tied to any recipe or license — grows steadily on its own, but the occasional
+                  rally or crash can move its price far more sharply than that.
+                </p>
+                <div className="bank-summary">
+                  <div>
+                    <span className="label">Price</span>
+                    <span className="value">{state.goldPrice.toFixed(1)}g{priceDelta('__gold__', state.goldPrice)}</span>
+                  </div>
+                  <div>
+                    <span className="label">Held</span>
+                    <span className="value">{state.player.goldHeld}</span>
+                  </div>
+                  <div>
+                    <span className="label">Value</span>
+                    <span className="value">{Math.round(state.player.goldHeld * state.goldPrice)}g</span>
+                  </div>
+                </div>
+                <PriceChart history={state.goldPriceHistory} currentTurn={state.turn} />
+                <div className="supply-form">
+                  <div className="form-row">
+                    <div className="field field-wide">
+                      <label>Quantity</label>
+                      <input type="number" min={1} value={goldQty} onChange={(e) => setGoldQty(Number(e.target.value))} />
+                    </div>
+                  </div>
+                  <div className="btn-row">
+                    <button className="discover-btn propose-btn"
+                      disabled={goldQty <= 0 || state.player.cash < goldQty * state.goldPrice}
+                      onClick={() => cmd({ kind: 'buyGold', qty: goldQty })}>
+                      Buy · {Math.round(goldQty * state.goldPrice)}g
+                    </button>
+                    <button
+                      disabled={goldQty <= 0 || state.player.goldHeld < goldQty}
+                      onClick={() => cmd({ kind: 'sellGold', qty: goldQty })}>
+                      Sell · {Math.round(goldQty * state.goldPrice)}g
+                    </button>
+                  </div>
+                </div>
               </>
             )}
 
@@ -974,6 +1037,40 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
                   (cash + facilities + inventory − debt) versus their cash alone. Not perfectly apples-to-apples, but the best
                   available comparison.
                 </p>
+              </>
+            )}
+
+            {tab === 'log' && (
+              <>
+                <div className="supply-form">
+                  <div className="form-row">
+                    <div className="field field-wide">
+                      <label>Filter</label>
+                      <input type="text" placeholder="e.g. Quota, license id, Gold…" value={logFilter}
+                        onChange={(e) => setLogFilter(e.target.value)} />
+                    </div>
+                  </div>
+                </div>
+                <table className="log-table">
+                  <thead><tr><th className="num">Turn</th><th>Event</th><th className="num">Δ Cash</th><th className="num">Cash after</th></tr></thead>
+                  <tbody>
+                    {state.ledger
+                      .filter((e) => e.label.toLowerCase().includes(logFilter.toLowerCase()))
+                      .slice()
+                      .reverse()
+                      .map((e, i) => (
+                        <tr key={state.ledger.length - i}>
+                          <td className="num">{e.turn}</td>
+                          <td>{e.label}</td>
+                          <td className={`num ${e.delta > 0 ? 'log-delta-up' : e.delta < 0 ? 'log-delta-down' : 'muted'}`}>
+                            {e.delta === 0 ? '—' : `${e.delta > 0 ? '+' : ''}${Math.round(e.delta)}g`}
+                          </td>
+                          <td className="num">{Math.round(e.cashAfter)}g</td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+                <p className="hint">Full unfiltered event log — every ledger entry ever recorded, newest first.</p>
               </>
             )}
           </div>

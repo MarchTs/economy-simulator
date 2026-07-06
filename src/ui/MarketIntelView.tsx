@@ -5,10 +5,13 @@ import type {
   StandingOfferContract,
   SupplyContract,
 } from '../engine/types';
+import { PriceChart } from './PriceChart';
 
 export interface MarketIntel {
   resourceId: ResourceId;
   resourceName: string;
+  priceHistory: number[];
+  currentTurn: number;
   boardQuests: QuestContract[];
   boardStanding: StandingOfferContract[];
   myQuests: QuestContract[];
@@ -17,7 +20,7 @@ export interface MarketIntel {
 }
 
 export function MarketIntelView({ intel, onClose }: { intel: MarketIntel; onClose: () => void }) {
-  const { resourceName, boardQuests, boardStanding, myQuests, mySupply, rivals } = intel;
+  const { resourceName, priceHistory, currentTurn, boardQuests, boardStanding, myQuests, mySupply, rivals } = intel;
   const nothingAtAll =
     boardQuests.length === 0 &&
     boardStanding.length === 0 &&
@@ -32,6 +35,9 @@ export function MarketIntelView({ intel, onClose }: { intel: MarketIntel; onClos
           <h3>📋 {resourceName} — contracts &amp; competitors</h3>
           <button className="tree-close" onClick={onClose}>✕</button>
         </div>
+
+        <h3 className="sub">Price history</h3>
+        <PriceChart history={priceHistory} currentTurn={currentTurn} />
 
         {nothingAtAll && (
           <p className="muted" style={{ padding: '12px 4px' }}>

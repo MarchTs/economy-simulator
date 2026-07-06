@@ -5,7 +5,7 @@ import type { MarketEntry } from './types';
 
 function marketFromBase(): Record<string, MarketEntry> {
   const m: Record<string, MarketEntry> = {};
-  for (const r of breweryScenario.resources) m[r.id] = { price: r.basePrice, supply: 100, demand: 100 };
+  for (const r of breweryScenario.resources) m[r.id] = { price: r.basePrice, supply: 100, demand: 100, priceHistory: [r.basePrice] };
   return m;
 }
 

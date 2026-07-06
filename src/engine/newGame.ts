@@ -1,4 +1,5 @@
 import type { ScenarioConfig } from '../scenarios/types';
+import { GOLD_STARTING_PRICE } from './reducer';
 import type { CompanyState, Facility, GameState, HeldLicense, MarketEntry, RivalCompany } from './types';
 
 function makeStartingFacility(scenario: ScenarioConfig): Facility {
@@ -36,7 +37,7 @@ function makeStartingLicense(scenario: ScenarioConfig): HeldLicense {
 function makeInitialMarket(scenario: ScenarioConfig): Record<string, MarketEntry> {
   const market: Record<string, MarketEntry> = {};
   for (const r of scenario.resources) {
-    market[r.id] = { price: r.basePrice, supply: 100, demand: 100 };
+    market[r.id] = { price: r.basePrice, supply: 100, demand: 100, priceHistory: [r.basePrice] };
   }
   return market;
 }
@@ -102,6 +103,7 @@ export function newGame(scenario: ScenarioConfig, seed: number): GameState {
     supplyContracts: [],
     loans: [],
     defenses: { insurance: false, legalTeam: false, safetyLevel: 0 },
+    goldHeld: 0,
   };
 
   return {
@@ -116,5 +118,7 @@ export function newGame(scenario: ScenarioConfig, seed: number): GameState {
     contractBoard: [],
     standingOfferBoard: [],
     rngState: seed >>> 0,
+    goldPrice: GOLD_STARTING_PRICE,
+    goldPriceHistory: [GOLD_STARTING_PRICE],
   };
 }

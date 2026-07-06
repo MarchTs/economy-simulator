@@ -186,6 +186,7 @@ export interface MarketEntry {
   price: number;
   supply: number;
   demand: number;
+  priceHistory: number[]; // one entry per turn (oldest first), capped — feeds the per-resource price chart
 }
 
 export interface CompanyState {
@@ -201,6 +202,7 @@ export interface CompanyState {
   supplyContracts: SupplyContract[];
   loans: Loan[];
   defenses: { insurance: boolean; legalTeam: boolean; safetyLevel: number };
+  goldHeld: number; // units of Gold owned — a speculative asset, not part of any recipe chain
 }
 
 // Banking, per doc §6.9 "reduced to a single loan action" for the run format:
@@ -235,6 +237,8 @@ export interface GameState {
   standingOfferBoard: StandingOfferContract[]; // seeded recurring "long quest" offers, not yet accepted
   rngState: number; // mulberry32 seed/state
   gameOver?: { result: 'bankrupt' | 'won' | 'ipo'; turn: number };
+  goldPrice: number; // current price per unit of Gold — universal across scenarios, not tied to any resource/recipe
+  goldPriceHistory: number[]; // one entry per turn (oldest first), capped — feeds the price chart
 }
 
 // Player-submitted actions for a single turn, applied in the PLAYER step.

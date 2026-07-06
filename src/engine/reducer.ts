@@ -3,7 +3,7 @@ import { refreshContractBoard, refreshStandingOfferBoard } from './contracts';
 import { makeDiscoveryChecker } from './discovery';
 import { rollEvent } from './events';
 import { updateAllMarkets } from './market';
-import { nextRandom } from './rng';
+import { nextRandom, randomRange } from './rng';
 import { repriceRival } from './rivals';
 import type {
   ActiveEffect,
@@ -26,6 +26,48 @@ const LEGAL_RETAINER = 25; // per turn, per doc §9 balance numbers
 const LEVEL_CAPACITY_BONUS = 0.25; // +25% base capacity per level above 1
 export const MAX_FACILITY_LEVEL = 5;
 const RENEWAL_FAILURE_SUSPENSION_TURNS = 3; // per doc §3's "2-3 turns" suspension range
+
+// Gold: a speculative asset, not part of any recipe chain — universal across
+// scenarios (unlike resources, it's not defined per-scenario). Drifts
+// randomly turn to turn (average +3%, but never the same two turns running),
+// with an occasional "incident" (rally or crash) that moves the price far
+// more sharply than the noisy drift ever would on its own.
+export const GOLD_STARTING_PRICE = 100;
+export const GOLD_GROWTH_RATE = 0.03; // average drift/turn — actual per-turn drift is randomized around this
+export const GOLD_GROWTH_NOISE = 0.06; // per-turn drift is uniformly random within +/- this band around the average
+const GOLD_INCIDENT_CHANCE = 0.15;
+const GOLD_RALLY_RANGE: [number, number] = [1.2, 1.6]; // multiplier applied on a rally
+const GOLD_CRASH_RANGE: [number, number] = [0.6, 0.85]; // multiplier applied on a crash
+export const GOLD_HISTORY_LIMIT = 200; // capped so a long game doesn't grow this array unbounded
+
+function runGoldPrice(state: GameState) {
+  const growth = randomRange(state.rngState, GOLD_GROWTH_RATE - GOLD_GROWTH_NOISE, GOLD_GROWTH_RATE + GOLD_GROWTH_NOISE);
+  state.rngState = growth.nextState;
+  state.goldPrice *= 1 + growth.value;
+
+  const roll = nextRandom(state.rngState);
+  state.rngState = roll.nextState;
+  if (roll.value <= GOLD_INCIDENT_CHANCE) {
+    const direction = nextRandom(state.rngState);
+    state.rngState = direction.nextState;
+    const isRally = direction.value < 0.5;
+
+    const range = isRally ? GOLD_RALLY_RANGE : GOLD_CRASH_RANGE;
+    const magnitude = randomRange(state.rngState, range[0], range[1]);
+    state.rngState = magnitude.nextState;
+
+    const before = state.goldPrice;
+    state.goldPrice *= magnitude.value;
+    const pctChange = Math.round((state.goldPrice / before - 1) * 100);
+    const label = isRally
+      ? `Gold rally — price spikes ${pctChange}%`
+      : `Gold crash — price drops ${Math.abs(pctChange)}%`;
+    addLedger(state.ledger, state.turn, label, 0, state.player.cash);
+  }
+
+  state.goldPriceHistory.push(state.goldPrice);
+  if (state.goldPriceHistory.length > GOLD_HISTORY_LIMIT) state.goldPriceHistory.shift();
+}
 
 // Ingredient-directed research targets a specific tier, so it's priced
 // steeper than the flat, random-outcome Breakthrough (scenario.researchCost) —
@@ -714,6 +756,7 @@ export function tick(prevState: GameState, scenario: ScenarioConfig): GameState 
 
   runUpkeep(state, scenario);
   runEvents(state, scenario);
+  runGoldPrice(state);
   runMarket(state, scenario);
   runContractBoard(state, scenario);
   runAutoProduction(state, scenario);
@@ -765,7 +808,9 @@ export type Command =
   | { kind: 'repayLoanEarly'; loanId: string }
   | { kind: 'payLoanNow'; loanId: string }
   | { kind: 'renewLicenseNow'; resourceId: ResourceId }
-  | { kind: 'payFacilityUpkeepNow'; facilityId: FacilityId };
+  | { kind: 'payFacilityUpkeepNow'; facilityId: FacilityId }
+  | { kind: 'buyGold'; qty: number }
+  | { kind: 'sellGold'; qty: number };
 
 export function applyCommand(prevState: GameState, cmd: Command, scenario: ScenarioConfig): GameState {
   const state = clone(prevState);
@@ -1156,6 +1201,26 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
           facility.upkeepPrepaid = true;
           addLedger(state.ledger, state.turn, `Paid upkeep+payroll early: ${facility.type}`, -total, player.cash);
         }
+      }
+      break;
+    }
+
+    case 'buyGold': {
+      const cost = cmd.qty * state.goldPrice;
+      if (cmd.qty > 0 && player.cash >= cost) {
+        player.cash -= cost;
+        player.goldHeld += cmd.qty;
+        addLedger(state.ledger, state.turn, `Bought ${cmd.qty} gold`, -cost, player.cash);
+      }
+      break;
+    }
+
+    case 'sellGold': {
+      const proceeds = cmd.qty * state.goldPrice;
+      if (cmd.qty > 0 && player.goldHeld >= cmd.qty) {
+        player.cash += proceeds;
+        player.goldHeld -= cmd.qty;
+        addLedger(state.ledger, state.turn, `Sold ${cmd.qty} gold`, proceeds, player.cash);
       }
       break;
     }

@@ -5,6 +5,7 @@ const PRESSURE_K = 0.05;
 const MAX_TURN_CHANGE = 0.15;
 const FLOOR_FACTOR = 0.4;
 const CEILING_FACTOR = 4.0;
+export const PRICE_HISTORY_LIMIT = 200; // capped so a long game doesn't grow this array unbounded
 
 // new_price = old_price * (1 + drift + pressure), clamped to +-15%/turn and
 // to [40%, 400%] of the resource's base price. See doc §4.
@@ -19,7 +20,9 @@ export function updatePrice(
   const clampedChange = Math.max(-MAX_TURN_CHANGE, Math.min(MAX_TURN_CHANGE, rawChange));
   let price = entry.price * (1 + clampedChange);
   price = Math.max(basePrice * FLOOR_FACTOR, Math.min(basePrice * CEILING_FACTOR, price));
-  return { entry: { ...entry, price }, nextState };
+  const priceHistory = [...(entry.priceHistory ?? []), price];
+  if (priceHistory.length > PRICE_HISTORY_LIMIT) priceHistory.shift();
+  return { entry: { ...entry, price, priceHistory }, nextState };
 }
 
 export function updateAllMarkets(

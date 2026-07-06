@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { breweryScenario } from '../scenarios/brewery/config';
+import { PRICE_HISTORY_LIMIT } from './market';
 import { newGame } from './newGame';
 import {
   applyCommand,
   effectiveCapacity,
   estimateBills,
+  GOLD_GROWTH_NOISE,
+  GOLD_GROWTH_RATE,
+  GOLD_HISTORY_LIMIT,
+  GOLD_STARTING_PRICE,
   grantDiscoveryLicense,
   ingredientResearchCost,
   levelUpCost,
@@ -204,8 +209,8 @@ describe('applyCommand — production & licensing', () => {
   });
 
   it('auto-produces an enabled output every tick up to capacity', () => {
-    // Seed 1 fires no disruptive event in the first two ticks.
-    let state = newGame(breweryScenario, 1);
+    // Seed 2 fires no disruptive event in the first two ticks.
+    let state = newGame(breweryScenario, 2);
     state = applyCommand(state, { kind: 'toggleAutoProduce', resourceId: 'barley', on: true }, breweryScenario);
     expect(state.player.autoProduce).toContain('barley');
     const before = state.player.inventory['barley']?.qty ?? 0;
@@ -217,7 +222,7 @@ describe('applyCommand — production & licensing', () => {
   });
 
   it('stops auto-producing once disabled', () => {
-    let state = newGame(breweryScenario, 1);
+    let state = newGame(breweryScenario, 2);
     state = applyCommand(state, { kind: 'toggleAutoProduce', resourceId: 'barley', on: true }, breweryScenario);
     state = tick(state, breweryScenario);
     const held = state.player.inventory['barley'].qty;
@@ -507,10 +512,14 @@ describe('applyCommand — research ladder', () => {
   });
 
   it('discovers a tier-3 recipe once its full tier-2 + tier-1 ingredient set is known and selected', () => {
+    // recipe_bottled_beer (keg_beer + glass_bottle) and recipe_whiskey
+    // (keg_beer alone) are both valid tier-3 candidates from this ingredient
+    // set — assert generically rather than assuming which one gets picked.
     let state = newGame(breweryScenario, 1);
     state.player.cash = 10000;
     state.player.knowledge.knownRecipeIds.add('recipe_keg_beer');
     state.player.knowledge.knownRecipeIds.add('recipe_glass_bottle');
+    const before = new Set(state.player.knowledge.knownRecipeIds);
     state = applyCommand(
       state,
       { kind: 'researchByIngredients', ingredients: ['keg_beer', 'glass_bottle'], targetTier: 3 },
@@ -519,7 +528,11 @@ describe('applyCommand — research ladder', () => {
     state = tick(state, breweryScenario);
     state = tick(state, breweryScenario);
     state = tick(state, breweryScenario);
-    expect(state.player.knowledge.knownRecipeIds.has('recipe_bottled_beer')).toBe(true);
+    const discoveredId = [...state.player.knowledge.knownRecipeIds].find((id) => !before.has(id));
+    expect(discoveredId).toBeDefined();
+    const discoveredRecipe = state.recipes.find((r) => r.id === discoveredId)!;
+    expect(discoveredRecipe.inputs.every((i) => ['keg_beer', 'glass_bottle'].includes(i.ingredientId))).toBe(true);
+    expect(breweryScenario.resources.find((r) => r.id === discoveredRecipe.output)?.tier).toBe(3);
   });
 
   it('knowing a tier-2 ingredient is not enough — it must also be selected, or a tier-3 recipe needing it is not found', () => {
@@ -618,7 +631,7 @@ describe('discovery disclosure', () => {
   });
 
   it('"exclusive" keeps it private for 30 minutes, then auto-publishes', () => {
-    let state = withPendingBottledBeerDisclosure(6);
+    let state = withPendingBottledBeerDisclosure(1);
     state = applyCommand(state, { kind: 'resolveDisclosure', choice: 'exclusive' }, breweryScenario);
     let recipe = state.recipes.find((r) => r.id === 'recipe_bottled_beer')!;
     expect(recipe.exclusiveTurnsLeft).toBe(30);
@@ -1338,5 +1351,145 @@ describe('estimateBills', () => {
       bills.buyContracts.reduce((s, c) => s + c.cost, 0);
     expect(bills.totalPerTurn).toBeCloseTo(expected, 5);
     expect(bills.totalPerTurn).toBeGreaterThan(0);
+  });
+});
+
+describe('Market price history', () => {
+  it('starts every resource with its base price as the sole history entry', () => {
+    const state = newGame(breweryScenario, 3);
+    for (const r of breweryScenario.resources) {
+      expect(state.market[r.id].priceHistory).toEqual([r.basePrice]);
+    }
+  });
+
+  it('records one price-history entry per turn, tracking the current price', () => {
+    let state = newGame(breweryScenario, 3);
+    state = tick(state, breweryScenario);
+    state = tick(state, breweryScenario);
+    const entry = state.market['barley'];
+    expect(entry.priceHistory.length).toBe(3);
+    expect(entry.priceHistory[entry.priceHistory.length - 1]).toBe(entry.price);
+  });
+
+  it('caps price history length so a long game does not grow it unbounded', () => {
+    let state = newGame(breweryScenario, 3);
+    state.market['barley'].priceHistory = Array(PRICE_HISTORY_LIMIT).fill(state.market['barley'].price);
+    state = tick(state, breweryScenario);
+    expect(state.market['barley'].priceHistory.length).toBe(PRICE_HISTORY_LIMIT);
+    expect(state.market['barley'].priceHistory[state.market['barley'].priceHistory.length - 1]).toBe(state.market['barley'].price);
+  });
+});
+
+describe('Gold', () => {
+  it('starts at the scenario-independent starting price with none held', () => {
+    const state = newGame(breweryScenario, 5);
+    expect(state.goldPrice).toBe(GOLD_STARTING_PRICE);
+    expect(state.player.goldHeld).toBe(0);
+  });
+
+  it('buying gold deducts cash at the current price and adds to holdings', () => {
+    let state = newGame(breweryScenario, 5);
+    const cashBefore = state.player.cash;
+    const price = state.goldPrice;
+    state = applyCommand(state, { kind: 'buyGold', qty: 3 }, breweryScenario);
+    expect(state.player.goldHeld).toBe(3);
+    expect(state.player.cash).toBeCloseTo(cashBefore - 3 * price, 5);
+  });
+
+  it('does not buy gold it cannot afford', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.cash = 1;
+    const next = applyCommand(state, { kind: 'buyGold', qty: 100 }, breweryScenario);
+    expect(next.player.goldHeld).toBe(0);
+    expect(next.player.cash).toBe(1);
+  });
+
+  it('selling gold credits cash at the current price and removes from holdings', () => {
+    let state = newGame(breweryScenario, 5);
+    state = applyCommand(state, { kind: 'buyGold', qty: 5 }, breweryScenario);
+    const cashBefore = state.player.cash;
+    const price = state.goldPrice;
+    state = applyCommand(state, { kind: 'sellGold', qty: 2 }, breweryScenario);
+    expect(state.player.goldHeld).toBe(3);
+    expect(state.player.cash).toBeCloseTo(cashBefore + 2 * price, 5);
+  });
+
+  it('does not sell more gold than is held', () => {
+    let state = newGame(breweryScenario, 5);
+    state = applyCommand(state, { kind: 'buyGold', qty: 2 }, breweryScenario);
+    const next = applyCommand(state, { kind: 'sellGold', qty: 5 }, breweryScenario);
+    expect(next.player.goldHeld).toBe(2); // unchanged — sale rejected
+  });
+
+  it('drifts within the noise band around the average rate on a quiet turn with no incident', () => {
+    // Growth is randomized per turn (not a fixed 3%), so just bound-check it
+    // against the documented noise band, isolated from the incident overlay.
+    let state = newGame(breweryScenario, 2);
+    const priceBefore = state.goldPrice;
+    state = tick(state, breweryScenario);
+    const incidentEntries = state.ledger.filter((e) => e.label.includes('Gold rally') || e.label.includes('Gold crash'));
+    if (incidentEntries.length === 0) {
+      const pctChange = state.goldPrice / priceBefore - 1;
+      expect(pctChange).toBeGreaterThanOrEqual(GOLD_GROWTH_RATE - GOLD_GROWTH_NOISE - 1e-9);
+      expect(pctChange).toBeLessThanOrEqual(GOLD_GROWTH_RATE + GOLD_GROWTH_NOISE + 1e-9);
+    } else {
+      // If this particular seed happens to roll an incident, at least confirm
+      // growth was applied before the incident multiplier (price moved further
+      // than a bare incident-only application would, in the rally case, or
+      // is still clearly derived from the grown base in the crash case).
+      expect(state.goldPrice).not.toBe(priceBefore);
+    }
+  });
+
+  it('does not drift by the same fixed amount two turns in a row', () => {
+    // Regression guard for the old deterministic +3%/turn formula — the
+    // per-turn drift must actually vary, not just be a relabeled constant.
+    let state = newGame(breweryScenario, 7);
+    const changes: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const before = state.goldPrice;
+      state = tick(state, breweryScenario);
+      changes.push(state.goldPrice / before - 1);
+    }
+    const allSame = changes.every((c) => Math.abs(c - changes[0]) < 1e-9);
+    expect(allSame).toBe(false);
+  });
+
+  it('an incident (rally or crash) moves the price far more than the base rate alone would', () => {
+    // Scan seeds for one whose very first tick rolls an incident, then check
+    // the swing is much larger than the steady 3%/turn drift.
+    let found = false;
+    for (let seed = 1; seed < 200 && !found; seed++) {
+      let state = newGame(breweryScenario, seed);
+      const priceBefore = state.goldPrice;
+      state = tick(state, breweryScenario);
+      const incident = state.ledger.find((e) => e.label.includes('Gold rally') || e.label.includes('Gold crash'));
+      if (!incident) continue;
+      found = true;
+      const pctChange = Math.abs(state.goldPrice / priceBefore - 1);
+      expect(pctChange).toBeGreaterThan(GOLD_GROWTH_RATE * 3); // well beyond bare 3% drift
+    }
+    expect(found).toBe(true); // sanity check the scan actually found an incident within range
+  });
+
+  it('records one price-history entry per turn, starting with the opening price', () => {
+    let state = newGame(breweryScenario, 3);
+    expect(state.goldPriceHistory).toEqual([GOLD_STARTING_PRICE]);
+    state = tick(state, breweryScenario);
+    state = tick(state, breweryScenario);
+    expect(state.goldPriceHistory.length).toBe(3);
+    expect(state.goldPriceHistory[state.goldPriceHistory.length - 1]).toBe(state.goldPrice);
+  });
+
+  it('caps price history length so a long game does not grow it unbounded', () => {
+    // Can't just tick hundreds of times — the game ends at WIN_TURN well
+    // before GOLD_HISTORY_LIMIT turns pass, and tick() is a no-op once
+    // gameOver is set. Pre-fill history to the cap instead, to isolate the
+    // shift-on-overflow behavior from turn-count/game-over mechanics.
+    let state = newGame(breweryScenario, 3);
+    state.goldPriceHistory = Array(GOLD_HISTORY_LIMIT).fill(state.goldPrice);
+    state = tick(state, breweryScenario);
+    expect(state.goldPriceHistory.length).toBe(GOLD_HISTORY_LIMIT);
+    expect(state.goldPriceHistory[state.goldPriceHistory.length - 1]).toBe(state.goldPrice);
   });
 });
