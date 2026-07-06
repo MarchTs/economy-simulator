@@ -8,6 +8,7 @@ import {
   effectiveCapacity,
   estimateBills,
   estimateRecipeSalePrice,
+  estimateResourceRate,
   ingredientResearchCost,
   levelUpCost,
   levelUpDuration,
@@ -102,6 +103,41 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
   const [borrowAmount, setBorrowAmount] = useState(500);
   const [goldQty, setGoldQty] = useState(1);
   const [logFilter, setLogFilter] = useState('');
+
+  // Drag-to-resize the Market/Tabs column split. null = default 6:5 flex ratio
+  // from CSS; once the user drags, marketColWidth pins the left panel to a
+  // fixed pixel width and the right panel (still flex:5) fills the rest.
+  const mainRef = useRef<HTMLDivElement>(null);
+  const [marketColWidth, setMarketColWidth] = useState<number | null>(null);
+  const resizingRef = useRef(false);
+
+  useEffect(() => {
+    function onMove(e: MouseEvent) {
+      if (!resizingRef.current || !mainRef.current) return;
+      const rect = mainRef.current.getBoundingClientRect();
+      const min = 220;
+      const max = rect.width - 300;
+      setMarketColWidth(Math.min(max, Math.max(min, e.clientX - rect.left)));
+    }
+    function onUp() {
+      if (!resizingRef.current) return;
+      resizingRef.current = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, []);
+
+  function startColResize() {
+    resizingRef.current = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }
 
   const [prevPrices, setPrevPrices] = useState<Record<string, number>>({});
   const [flash, setFlash] = useState<string[]>([]); // recent event log lines
@@ -290,7 +326,7 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
           </div>
         </div>
         <div className="stat"><span className="label">Reputation</span><span className="value">{Math.round(state.player.reputation)}</span></div>
-        <div className="stat"><span className="label">Licenses</span><span className="value">{state.player.licenses.length}/{state.player.licenseSlots}</span></div>
+        <div className="stat"><span className="label">Licenses</span><span className="value">{state.player.licenses.length}</span></div>
 
         <div className="effects">
           {state.activeEffects.map((e) => (
@@ -347,8 +383,8 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
         </div>
       )}
 
-      <div className="main">
-        <section className="panel market-col">
+      <div className="main" ref={mainRef}>
+        <section className="panel market-col" style={marketColWidth != null ? { flex: `0 0 ${marketColWidth}px` } : undefined}>
           <div className="panel-head market-head">
             <h2>Market &amp; Inventory</h2>
             <label className="show-all-toggle">
@@ -359,18 +395,24 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
           <div className="panel-body">
             <table>
               <thead>
-                <tr><th>Resource</th><th className="num">Price</th><th className="num">Held</th><th className="num">Rate</th></tr>
+                <tr><th>Resource</th><th className="num">Price</th><th className="num">Held</th><th className="num">Rate</th><th className="num">Margin</th></tr>
               </thead>
               <tbody>
                 {visibleResources.map((r) => {
                   const entry = state.market[r.id];
-                  const licensed = state.player.licenses.some((l) => l.resourceId === r.id && l.status === 'active');
-                  const recipe = state.recipes.find((rec) => rec.output === r.id);
-                  const known = recipe !== undefined && state.player.knowledge.knownRecipeIds.has(recipe.id);
                   const facility = state.player.facilities.find((f) => f.type === r.facility && f.buildTurnsLeft === 0);
                   const on = state.player.autoProduce.includes(r.id);
-                  // Capacity is a flat per-turn number.
-                  const perTurn = facility ? Math.round(effectiveCapacity(facility)) : 0;
+                  const rate = estimateResourceRate(state, scenario, r.id);
+                  const hasRate = rate.production > 0 || rate.ingredientUse.length > 0 || rate.sellContracts > 0 || rate.buyContracts > 0;
+                  const net = Math.round(rate.net);
+                  const licensed = state.player.licenses.some((l) => l.resourceId === r.id && l.status === 'active');
+                  const recipeForMargin = state.recipes.find((rec) => rec.output === r.id);
+                  const known = recipeForMargin !== undefined && state.player.knowledge.knownRecipeIds.has(recipeForMargin.id);
+                  const tree = licensed && known && facility
+                    ? buildRecipeTree(r.id, scenario.resources, state.recipes, state.market, state.player.knowledge.knownRecipeIds)
+                    : null;
+                  const margin = tree ? tree.buyDirectPrice - tree.rawMaterialCost : 0;
+                  const marginPct = tree && tree.rawMaterialCost > 0 ? (margin / tree.rawMaterialCost) * 100 : 0;
                   return (
                     <tr key={r.id} className="clickable-row" title="Click row for contracts & competitor intel"
                       onClick={() => setIntelResource(r.id)}>
@@ -380,7 +422,48 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
                       </td>
                       <td className="num">{entry.price.toFixed(1)}g{priceDelta(r.id, entry.price)}</td>
                       <td className="num">{state.player.inventory[r.id]?.qty ?? 0}</td>
-                      <td className="num">{licensed && known && facility ? `${perTurn}/turn${on ? '' : ' (off)'}` : '—'}</td>
+                      <td className="num hover-cell">
+                        {hasRate ? (
+                          <>
+                            <span className={net > 0 ? 'stat-up' : net < 0 ? 'stat-down' : 'muted'}>
+                              {net}/turn{facility && !on ? ' (off)' : ''}
+                            </span>
+                            <div className="hover-tooltip">
+                              {rate.production > 0 && (
+                                <div className="tooltip-row"><span>Production{on ? '' : ' (off)'}</span><span>+{Math.round(rate.production)}/turn</span></div>
+                              )}
+                              {rate.ingredientUse.map((u) => (
+                                <div className="tooltip-row" key={u.resourceId}>
+                                  <span>Used by {resourceName(u.resourceId)} <em>(ingredient)</em></span><span>−{Math.round(u.amount)}/turn</span>
+                                </div>
+                              ))}
+                              {rate.sellContracts > 0 && (
+                                <div className="tooltip-row"><span>Supply contract <em>(sell)</em></span><span>−{Math.round(rate.sellContracts)}/turn</span></div>
+                              )}
+                              {rate.buyContracts > 0 && (
+                                <div className="tooltip-row"><span>Supply contract <em>(buy)</em></span><span>+{Math.round(rate.buyContracts)}/turn</span></div>
+                              )}
+                              <div className="tooltip-row total"><span>Net</span><span>{net}/turn</span></div>
+                            </div>
+                          </>
+                        ) : '—'}
+                      </td>
+                      <td className="num hover-cell">
+                        {tree ? (
+                          <>
+                            <span className={margin > 0 ? 'stat-up' : margin < 0 ? 'stat-down' : 'muted'}>
+                              {margin >= 0 ? '+' : ''}{Math.round(margin)}g
+                            </span>
+                            <div className="hover-tooltip">
+                              <div className="tooltip-row"><span>Sell price</span><span>{Math.round(tree.buyDirectPrice)}g</span></div>
+                              <div className="tooltip-row"><span>Raw material cost</span><span>{Math.round(tree.rawMaterialCost)}g</span></div>
+                              <div className="tooltip-row total">
+                                <span>Margin</span><span>{margin >= 0 ? '+' : ''}{Math.round(margin)}g ({marginPct >= 0 ? '+' : ''}{marginPct.toFixed(0)}%)</span>
+                              </div>
+                            </div>
+                          </>
+                        ) : '—'}
+                      </td>
                     </tr>
                   );
                 })}
@@ -388,6 +471,8 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
             </table>
           </div>
         </section>
+
+        <div className="col-resizer" onMouseDown={startColResize} />
 
         <section className="panel tab-col">
           <div className="tabs">
@@ -435,7 +520,7 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
                         <td>
                           {!held && (
                             <button
-                              disabled={state.player.licenses.length >= state.player.licenseSlots || state.player.reputation < def.minReputation || state.player.cash < def.upfrontCost}
+                              disabled={state.player.reputation < def.minReputation || state.player.cash < def.upfrontCost}
                               onClick={() => cmd({ kind: 'buyLicense', resourceId: def.resourceId })}>
                               Buy
                             </button>
@@ -719,10 +804,10 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
                           <td className="num">{c.missedStreak}</td>
                           <td>
                             {c.settledThisTurn ? (
-                              <span className="muted">Sent</span>
+                              <span className="muted">{c.side === 'sell' ? 'Sent' : 'Bought'}</span>
                             ) : (
                               <button disabled={!canSend} onClick={() => cmd({ kind: 'sendSupplyContractNow', id: c.id })}>
-                                Send now
+                                {c.side === 'sell' ? 'Send now' : 'Buy now'}
                               </button>
                             )}
                           </td>
@@ -734,7 +819,7 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
                   </tbody>
                 </table>
                 <p className="hint">
-                  "Send now" settles this turn's delivery/purchase early — the automatic end-of-turn settlement is skipped once it's sent.
+                  "Send now"/"Buy now" settles this turn's delivery/purchase early — the automatic end-of-turn settlement is skipped once it's done.
                 </p>
                 <div className="supply-form">
                   <div className="form-row">
@@ -933,10 +1018,14 @@ function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => vo
                           <td className="num">{Math.round(payment)}g</td>
                           <td className="num">{Math.round(l.remaining)}g</td>
                           <td>
-                            <button disabled={state.player.cash < payment}
-                              onClick={() => cmd({ kind: 'payLoanNow', loanId: l.id })}>
-                              Pay now
-                            </button>
+                            {l.settledThisTurn ? (
+                              <span className="muted">Paid</span>
+                            ) : (
+                              <button disabled={state.player.cash < payment}
+                                onClick={() => cmd({ kind: 'payLoanNow', loanId: l.id })}>
+                                Pay now
+                              </button>
+                            )}
                           </td>
                         </tr>
                       );

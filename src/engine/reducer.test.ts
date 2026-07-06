@@ -6,6 +6,7 @@ import {
   applyCommand,
   effectiveCapacity,
   estimateBills,
+  estimateResourceRate,
   GOLD_GROWTH_NOISE,
   GOLD_GROWTH_RATE,
   GOLD_HISTORY_LIMIT,
@@ -273,7 +274,6 @@ describe('applyCommand — production & licensing', () => {
   it("recipe_keg_beer's full ingredient chain (malt + hops + yeast_culture) can actually complete end-to-end", () => {
     let state = newGame(breweryScenario, 3);
     state.player.cash = 2_000_000; // headroom for facility builds/upkeep across many ticks
-    state.player.licenseSlots = 10;
 
     // Bypass the RNG-driven discovery ladder (covered by the "research ladder"
     // and "discovery disclosure" tests above) to isolate production mechanics:
@@ -675,7 +675,6 @@ describe('discovery disclosure', () => {
 describe('discovery grants ownership', () => {
   it('discovering a recipe grants its license for free, no purchase needed', () => {
     let state = newGame(breweryScenario, 4);
-    state.player.licenseSlots = 2; // room for the discovery grant alongside the starting Barley license
     state = step(state, [{ kind: 'researchBlind' }]);
     state = step(state);
     state = step(state);
@@ -694,26 +693,11 @@ describe('discovery grants ownership', () => {
     expect(state.player.licenses.filter((l) => l.resourceId === 'barley')).toHaveLength(1);
   });
 
-  it('does not grant a license when the discoverer has no free license slot', () => {
-    let state = newGame(breweryScenario, 4);
-    state.player.licenseSlots = 1; // already at cap with the starting Barley license
-    state = step(state, [{ kind: 'researchBlind' }]);
-    state = step(state);
-    state = step(state);
-    const discoveredId = [...state.player.knowledge.knownRecipeIds].find((id) => id !== 'recipe_extract_barley')!;
-    const discoveredRecipe = state.recipes.find((r) => r.id === discoveredId)!;
-    // Still learned the recipe...
-    expect(state.player.knowledge.knownRecipeIds.has(discoveredId)).toBe(true);
-    // ...but no license was granted since there was no room.
-    expect(state.player.licenses).toHaveLength(1);
-    expect(state.player.licenses.some((l) => l.resourceId === discoveredRecipe.output)).toBe(false);
-  });
-
   it('grantDiscoveryLicense has no cross-company exclusivity — independent discoverers each get their own license', () => {
     const scenario = breweryScenario;
     const rice = 'rice';
-    const playerLicenses = grantDiscoveryLicense([], 5, rice, scenario);
-    const rivalLicenses = grantDiscoveryLicense([], 5, rice, scenario);
+    const playerLicenses = grantDiscoveryLicense([], rice, scenario);
+    const rivalLicenses = grantDiscoveryLicense([], rice, scenario);
     // Both succeed independently — one company's grant doesn't block another's.
     expect(playerLicenses.some((l) => l.resourceId === rice)).toBe(true);
     expect(rivalLicenses.some((l) => l.resourceId === rice)).toBe(true);
@@ -1023,21 +1007,34 @@ describe('bank loan', () => {
     expect(state.player.loans[0].remaining).toBeCloseTo(loan.remaining - loan.paymentPerTurn, 5);
   });
 
-  it('paying one installment early does not cause an extra charge overall — it just shifts the timing', () => {
-    // Path A: pay one installment manually, then let one tick run.
+  it('paying one installment early does not cause an extra charge — it just moves the same charge earlier', () => {
+    // Path A: pay manually now, then let the tick run — the automatic charge
+    // must be SKIPPED (settledThisTurn), not stacked on top of the manual one.
     let pathA = newGame(breweryScenario, 5);
     pathA = applyCommand(pathA, { kind: 'takeLoan', amount: 500 }, breweryScenario);
     pathA = applyCommand(pathA, { kind: 'payLoanNow', loanId: pathA.player.loans[0].id }, breweryScenario);
     pathA = tick(pathA, breweryScenario);
 
-    // Path B: let two ticks run automatically, no manual payment at all.
+    // Path B: no manual payment at all — just the automatic tick charge.
     let pathB = newGame(breweryScenario, 5);
     pathB = applyCommand(pathB, { kind: 'takeLoan', amount: 500 }, breweryScenario);
     pathB = tick(pathB, breweryScenario);
-    pathB = tick(pathB, breweryScenario);
 
-    // Same two installments' worth paid down in both paths — no double charge.
+    // Exactly one installment's worth paid down in both paths — paying early
+    // moved the SAME charge earlier in time rather than adding a second one.
     expect(pathA.player.loans[0]?.remaining ?? 0).toBeCloseTo(pathB.player.loans[0]?.remaining ?? 0, 5);
+    expect(pathA.player.cash).toBeCloseTo(pathB.player.cash, 5);
+  });
+
+  it('clicking Pay now twice in the same turn only charges once', () => {
+    let state = newGame(breweryScenario, 5);
+    state = applyCommand(state, { kind: 'takeLoan', amount: 500 }, breweryScenario);
+    const loan = state.player.loans[0];
+    const cashAfterFirst = (state = applyCommand(state, { kind: 'payLoanNow', loanId: loan.id }, breweryScenario)).player.cash;
+    const remainingAfterFirst = state.player.loans[0].remaining;
+    state = applyCommand(state, { kind: 'payLoanNow', loanId: loan.id }, breweryScenario);
+    expect(state.player.cash).toBe(cashAfterFirst); // second click this turn is a no-op
+    expect(state.player.loans[0].remaining).toBe(remainingAfterFirst);
   });
 
   it('payLoanNow does nothing if cash is insufficient', () => {
@@ -1073,7 +1070,6 @@ describe('quota check runs on its own cadence, independent of the renewal cycle'
   it('does not lapse a quota-gated license at its first renewal, before the quota period has elapsed', () => {
     let state = newGame(breweryScenario, 5);
     state.player.cash = 1_000_000;
-    state.player.licenseSlots = 10;
     state = applyCommand(state, { kind: 'buyLicense', resourceId: 'keg_beer' }, breweryScenario);
     const def = breweryScenario.licenses.find((l) => l.resourceId === 'keg_beer')!;
     expect(def.renewalPeriod).toBeLessThan(def.quotaPeriodTurns!); // the exact mismatch that caused the bug
@@ -1089,7 +1085,6 @@ describe('quota check runs on its own cadence, independent of the renewal cycle'
   it('does lapse a quota-gated license once its own quota period elapses with the quota unmet', () => {
     let state = newGame(breweryScenario, 5);
     state.player.cash = 1_000_000;
-    state.player.licenseSlots = 10;
     state = applyCommand(state, { kind: 'buyLicense', resourceId: 'keg_beer' }, breweryScenario);
     const def = breweryScenario.licenses.find((l) => l.resourceId === 'keg_beer')!;
 
@@ -1103,7 +1098,6 @@ describe('quota check runs on its own cadence, independent of the renewal cycle'
   it('resets unitsProducedThisPeriod and the quota countdown independently of the renewal countdown', () => {
     let state = newGame(breweryScenario, 5);
     state.player.cash = 1_000_000;
-    state.player.licenseSlots = 10;
     state = applyCommand(state, { kind: 'buyLicense', resourceId: 'keg_beer' }, breweryScenario);
     const def = breweryScenario.licenses.find((l) => l.resourceId === 'keg_beer')!;
     let lic = state.player.licenses.find((l) => l.resourceId === 'keg_beer')!;
@@ -1351,6 +1345,73 @@ describe('estimateBills', () => {
       bills.buyContracts.reduce((s, c) => s + c.cost, 0);
     expect(bills.totalPerTurn).toBeCloseTo(expected, 5);
     expect(bills.totalPerTurn).toBeGreaterThan(0);
+  });
+});
+
+describe('estimateResourceRate', () => {
+  it('reports gross production when nothing else touches the resource', () => {
+    const state = newGame(breweryScenario, 5);
+    const farm = state.player.facilities.find((f) => f.type === 'farm')!;
+    const rate = estimateResourceRate(state, breweryScenario, 'barley');
+    expect(rate.production).toBe(effectiveCapacity(farm));
+    expect(rate.ingredientUse).toHaveLength(0);
+    expect(rate.sellContracts).toBe(0);
+    expect(rate.buyContracts).toBe(0);
+    expect(rate.net).toBe(effectiveCapacity(farm));
+  });
+
+  it('subtracts ingredient demand from another auto-produced output', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.cash = 1_000_000;
+    state = applyCommand(state, { kind: 'buyLicense', resourceId: 'malt' }, breweryScenario);
+    state = applyCommand(state, { kind: 'buildFacility', facilityType: 'malthouse', resourceId: 'malt' }, breweryScenario);
+    const malthouse = state.player.facilities.find((f) => f.type === 'malthouse')!;
+    malthouse.hiredWorkers = malthouse.requiredWorkers; // staff it up — buildFacility starts at 0
+    malthouse.buildTurnsLeft = 0; // skip construction wait for this unit test
+    state.player.knowledge.knownRecipeIds.add('recipe_malt');
+    expect(state.player.autoProduce).toContain('malt'); // buildFacility auto-enables it
+
+    const farm = state.player.facilities.find((f) => f.type === 'farm')!;
+    const maltRecipe = breweryScenario.recipes.find((r) => r.id === 'recipe_malt')!;
+    const expectedMaltDemand = (effectiveCapacity(malthouse) / maltRecipe.outputQty) * maltRecipe.inputs[0].qty;
+
+    const rate = estimateResourceRate(state, breweryScenario, 'barley');
+    expect(rate.ingredientUse).toEqual([{ resourceId: 'malt', amount: expectedMaltDemand }]);
+    expect(rate.net).toBeCloseTo(effectiveCapacity(farm) - expectedMaltDemand, 5);
+  });
+
+  it('excludes ingredient demand from a producer that is toggled off', () => {
+    let state = newGame(breweryScenario, 5);
+    state.player.cash = 1_000_000;
+    state = applyCommand(state, { kind: 'buyLicense', resourceId: 'malt' }, breweryScenario);
+    state = applyCommand(state, { kind: 'buildFacility', facilityType: 'malthouse', resourceId: 'malt' }, breweryScenario);
+    const malthouse = state.player.facilities.find((f) => f.type === 'malthouse')!;
+    malthouse.hiredWorkers = malthouse.requiredWorkers;
+    malthouse.buildTurnsLeft = 0;
+    state.player.knowledge.knownRecipeIds.add('recipe_malt');
+    state = applyCommand(state, { kind: 'toggleAutoProduce', resourceId: 'malt', on: false }, breweryScenario);
+
+    const rate = estimateResourceRate(state, breweryScenario, 'barley');
+    expect(rate.ingredientUse).toHaveLength(0);
+  });
+
+  it('subtracts active sell contracts and adds active buy contracts', () => {
+    let state = newGame(breweryScenario, 5);
+    state = applyCommand(
+      state,
+      { kind: 'proposeSupplyContract', side: 'sell', resourceId: 'barley', qtyPerTurn: 5, price: 4, turnsLeft: 5 },
+      breweryScenario
+    );
+    state = applyCommand(
+      state,
+      { kind: 'proposeSupplyContract', side: 'buy', resourceId: 'barley', qtyPerTurn: 3, price: 4, turnsLeft: 5 },
+      breweryScenario
+    );
+    const farm = state.player.facilities.find((f) => f.type === 'farm')!;
+    const rate = estimateResourceRate(state, breweryScenario, 'barley');
+    expect(rate.sellContracts).toBe(5);
+    expect(rate.buyContracts).toBe(3);
+    expect(rate.net).toBeCloseTo(effectiveCapacity(farm) - 5 + 3, 5);
   });
 });
 

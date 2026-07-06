@@ -107,21 +107,15 @@ function facilityTypeDef(scenario: ScenarioConfig, type: string) {
 }
 
 // Whoever discovers a recipe owns its license — for free, no purchase step.
-// This is deliberately non-exclusive: it only checks the discoverer's OWN
-// licenses/slots, so if the player and a rival happen to discover the same
-// recipe (even the same turn), each gets their own grant independently —
-// ownership "splits" between simultaneous discoverers rather than one
-// blocking the other. Returns the same array reference if nothing changed
-// (already held, or no free slot), so callers can check `!== licenses` to
-// know whether a grant actually happened.
-export function grantDiscoveryLicense(
-  licenses: HeldLicense[],
-  licenseSlots: number,
-  resourceId: ResourceId,
-  scenario: ScenarioConfig
-): HeldLicense[] {
+// Licenses are unlimited (no slot cap), so this only ever declines when the
+// discoverer already holds it. This is deliberately non-exclusive: if the
+// player and a rival happen to discover the same recipe (even the same
+// turn), each gets their own grant independently — ownership "splits"
+// between simultaneous discoverers rather than one blocking the other.
+// Returns the same array reference if nothing changed, so callers can check
+// `!== licenses` to know whether a grant actually happened.
+export function grantDiscoveryLicense(licenses: HeldLicense[], resourceId: ResourceId, scenario: ScenarioConfig): HeldLicense[] {
   if (licenses.some((l) => l.resourceId === resourceId)) return licenses;
-  if (licenses.length >= licenseSlots) return licenses;
   const def = licenseDefById(scenario, resourceId);
   return [
     ...licenses,
@@ -161,7 +155,7 @@ export interface BillsBreakdown {
   facilities: { facilityId: FacilityId; type: string; upkeep: number; payroll: number; prepaid: boolean }[];
   insurance: number;
   legalRetainer: number;
-  loanPayments: { loanId: string; payment: number }[];
+  loanPayments: { loanId: string; payment: number; settled: boolean }[];
   buyContracts: { contractId: string; resourceId: ResourceId; cost: number }[];
   // Periodic, not per-turn — informational only, excluded from totalPerTurn.
   licenseRenewals: { resourceId: ResourceId; cost: number; turnsUntilRenewal: number }[];
@@ -193,7 +187,8 @@ export function estimateBills(state: GameState, scenario: ScenarioConfig): Bills
 
   const loanPayments = player.loans.map((l) => ({
     loanId: l.id,
-    payment: Math.min(l.paymentPerTurn, l.remaining),
+    payment: l.settledThisTurn ? 0 : Math.min(l.paymentPerTurn, l.remaining),
+    settled: l.settledThisTurn,
   }));
 
   const buyContracts = player.supplyContracts
@@ -213,6 +208,65 @@ export function estimateBills(state: GameState, scenario: ScenarioConfig): Bills
     buyContracts.reduce((sum, c) => sum + c.cost, 0);
 
   return { facilities, insurance, legalRetainer, loanPayments, buyContracts, licenseRenewals, totalPerTurn };
+}
+
+export interface ResourceRateBreakdown {
+  production: number; // gross facility output, 0 if not licensed/known/built/auto-produce-enabled
+  ingredientUse: { resourceId: ResourceId; amount: number }[]; // consumed as an input by this OTHER output's own auto-production
+  sellContracts: number; // shipped away per turn via active 'sell' supply contracts
+  buyContracts: number; // brought in per turn via active 'buy' supply contracts
+  net: number;
+}
+
+// A steady-state estimate of a resource's per-turn inventory change: gross
+// production minus whatever other auto-produced outputs consume it as an
+// ingredient, minus/plus supply contract flow. Deliberately excludes
+// one-off/random effects (quest deliveries, spoilage, disaster events) since
+// those aren't a recurring "rate" — this is what the Market table's Rate
+// column shows instead of raw facility capacity, per user request that the
+// figure already net out contracts/ingredient use rather than needing to be
+// mentally adjusted. Approximation: an ingredient consumer's own demand is
+// estimated at ITS full capacity, not checked against ITS OWN ingredient
+// availability — good enough for a planning figure, not a tick-exact replay.
+export function estimateResourceRate(state: GameState, scenario: ScenarioConfig, resourceId: ResourceId): ResourceRateBreakdown {
+  const player = state.player;
+  const resource = resourceById(scenario, resourceId);
+  const licensed = player.licenses.some((l) => l.resourceId === resourceId && l.status === 'active');
+  const known = state.recipes.some((r) => r.output === resourceId && player.knowledge.knownRecipeIds.has(r.id));
+  const facility = player.facilities.find(
+    (f) => f.type === resource.facility && f.assignedResourceId === resourceId && f.buildTurnsLeft === 0
+  );
+  const on = player.autoProduce.includes(resourceId);
+  const production = licensed && known && facility && on ? effectiveCapacity(facility) : 0;
+
+  const ingredientUse: { resourceId: ResourceId; amount: number }[] = [];
+  for (const otherId of player.autoProduce) {
+    if (otherId === resourceId) continue;
+    const recipe = state.recipes.find((r) => r.output === otherId);
+    const input = recipe?.inputs.find((i) => i.ingredientId === resourceId);
+    if (!recipe || !input) continue;
+    if (!player.knowledge.knownRecipeIds.has(recipe.id)) continue;
+    if (!player.licenses.some((l) => l.resourceId === otherId && l.status === 'active')) continue;
+    const otherResource = resourceById(scenario, otherId);
+    const otherFacility = player.facilities.find(
+      (f) => f.type === otherResource.facility && f.assignedResourceId === otherId && f.buildTurnsLeft === 0
+    );
+    if (!otherFacility) continue;
+    const batches = effectiveCapacity(otherFacility) / recipe.outputQty;
+    const amount = batches * input.qty;
+    if (amount > 0) ingredientUse.push({ resourceId: otherId, amount });
+  }
+
+  let sellContracts = 0;
+  let buyContracts = 0;
+  for (const c of player.supplyContracts) {
+    if (c.resourceId !== resourceId) continue;
+    if (c.side === 'sell') sellContracts += c.qtyPerTurn;
+    else buyContracts += c.qtyPerTurn;
+  }
+
+  const net = production - ingredientUse.reduce((sum, u) => sum + u.amount, 0) - sellContracts + buyContracts;
+  return { production, ingredientUse, sellContracts, buyContracts, net };
 }
 
 // --- UPKEEP -----------------------------------------------------------
@@ -544,7 +598,7 @@ function runResearchProgress(state: GameState, scenario: ScenarioConfig) {
     const chosen = candidates[Math.floor(value * candidates.length)];
     known.add(chosen.id);
     if (!chosen.firstDiscoveredTurn) chosen.firstDiscoveredTurn = state.turn;
-    addLedger(state.ledger, state.turn, `Research discovered: ${chosen.output}`, 0, player.cash);
+    addLedger(state.ledger, state.turn, `You discovered: ${chosen.output}`, 0, player.cash);
     // A recipe that's already published (e.g. Malt) is common industry
     // knowledge rivals had from turn 1 — there's no real disclosure choice to
     // make (exclusivity was never actually possible), so don't offer one.
@@ -552,8 +606,8 @@ function runResearchProgress(state: GameState, scenario: ScenarioConfig) {
       state.pendingDisclosures.push({ recipeId: chosen.id });
     }
     // Discovering it means owning it — a free license grant, not just
-    // knowledge. Skipped only if already held or out of license slots.
-    const grantedLicenses = grantDiscoveryLicense(player.licenses, player.licenseSlots, chosen.output, scenario);
+    // knowledge. Licenses are unlimited, so this only skips if already held.
+    const grantedLicenses = grantDiscoveryLicense(player.licenses, chosen.output, scenario);
     if (grantedLicenses !== player.licenses) {
       player.licenses = grantedLicenses;
       addLedger(state.ledger, state.turn, `License granted (discovery reward): ${chosen.output}`, 0, player.cash);
@@ -591,7 +645,7 @@ function runRivalResearch(state: GameState, scenario: ScenarioConfig) {
     rival.knownRecipeIds.add(chosen.id);
     if (!chosen.firstDiscoveredTurn) chosen.firstDiscoveredTurn = state.turn;
 
-    const grantedLicenses = grantDiscoveryLicense(rival.licenses, rival.licenseSlots, chosen.output, scenario);
+    const grantedLicenses = grantDiscoveryLicense(rival.licenses, chosen.output, scenario);
     const gotLicense = grantedLicenses !== rival.licenses;
     rival.licenses = grantedLicenses;
     addLedger(
@@ -673,15 +727,21 @@ function runSupplyContracts(state: GameState) {
 function runLoanPayments(state: GameState) {
   const player = state.player;
   for (const loan of player.loans) {
-    const payment = Math.min(loan.paymentPerTurn, loan.remaining);
-    if (player.cash >= payment) {
-      player.cash -= payment;
-      loan.remaining -= payment;
-      addLedger(state.ledger, state.turn, 'Loan payment', -payment, player.cash);
+    if (loan.settledThisTurn) {
+      // Already paid early this turn via payLoanNow — don't charge again,
+      // just clear the flag for next turn.
+      loan.settledThisTurn = false;
     } else {
-      loan.missedPayments += 1;
-      player.reputation = Math.max(0, player.reputation - LOAN_MISS_REPUTATION_PENALTY);
-      addLedger(state.ledger, state.turn, 'Missed loan payment', 0, player.cash);
+      const payment = Math.min(loan.paymentPerTurn, loan.remaining);
+      if (player.cash >= payment) {
+        player.cash -= payment;
+        loan.remaining -= payment;
+        addLedger(state.ledger, state.turn, 'Loan payment', -payment, player.cash);
+      } else {
+        loan.missedPayments += 1;
+        player.reputation = Math.max(0, player.reputation - LOAN_MISS_REPUTATION_PENALTY);
+        addLedger(state.ledger, state.turn, 'Missed loan payment', 0, player.cash);
+      }
     }
     loan.termTurnsLeft = Math.max(0, loan.termTurnsLeft - 1);
   }
@@ -869,7 +929,7 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
     case 'buyLicense': {
       const def = licenseDefById(scenario, cmd.resourceId);
       const already = player.licenses.some((l) => l.resourceId === def.resourceId);
-      if (!already && player.licenses.length < player.licenseSlots && player.cash >= def.upfrontCost && player.reputation >= def.minReputation) {
+      if (!already && player.cash >= def.upfrontCost && player.reputation >= def.minReputation) {
         player.cash -= def.upfrontCost;
         player.licenses.push({
           resourceId: def.resourceId,
@@ -1131,6 +1191,7 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
           paymentPerTurn: Math.round((remaining / LOAN_TERM_TURNS) * 100) / 100,
           termTurnsLeft: LOAN_TERM_TURNS,
           missedPayments: 0,
+          settledThisTurn: false,
         };
         player.cash += cmd.amount;
         player.loans.push(newLoan);
@@ -1155,11 +1216,12 @@ export function applyCommand(prevState: GameState, cmd: Command, scenario: Scena
     // nothing) once the turn actually ends.
     case 'payLoanNow': {
       const loan = player.loans.find((l) => l.id === cmd.loanId);
-      if (loan) {
+      if (loan && !loan.settledThisTurn) {
         const payment = Math.min(loan.paymentPerTurn, loan.remaining);
         if (payment > 0 && player.cash >= payment) {
           player.cash -= payment;
           loan.remaining -= payment;
+          loan.settledThisTurn = true;
           addLedger(state.ledger, state.turn, 'Paid loan installment early', -payment, player.cash);
           if (loan.remaining <= 0) {
             player.loans = player.loans.filter((l) => l.id !== loan.id);

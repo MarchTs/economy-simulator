@@ -175,7 +175,6 @@ export interface RivalCompany {
   cash: number;
   reputation: number;
   licenses: HeldLicense[];
-  licenseSlots: number;
   knownRecipeIds: Set<string>;
   postedPrices: Record<ResourceId, number>;
   unitCost: Record<ResourceId, number>;
@@ -194,7 +193,6 @@ export interface CompanyState {
   reputation: number;
   inventory: Record<ResourceId, InventoryEntry>;
   licenses: HeldLicense[];
-  licenseSlots: number;
   facilities: Facility[];
   knowledge: CompanyKnowledge;
   autoProduce: ResourceId[]; // outputs set to auto-produce each tick (real-time)
@@ -214,6 +212,7 @@ export interface Loan {
   paymentPerTurn: number;
   termTurnsLeft: number; // informational — payments continue past 0 if behind
   missedPayments: number;
+  settledThisTurn: boolean; // true if paid early via payLoanNow; runLoanPayments skips it and resets the flag
 }
 
 export interface LedgerEntry {

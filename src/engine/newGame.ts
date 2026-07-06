@@ -47,8 +47,6 @@ const RIVAL_NAMES: { name: string; personality: RivalCompany['personality'] }[] 
   { name: 'Heritage Brewers', personality: 'premium' },
 ];
 
-const RIVAL_LICENSE_SLOTS = 3;
-
 // Rivals start selling whatever the scenario's first publicly-known recipe
 // makes (Brewery: Malt; Bakery: Flour) — scenario-driven so this isn't
 // hardcoded to one industry's output.
@@ -78,7 +76,6 @@ function makeRivals(scenario: ScenarioConfig): RivalCompany[] {
     licenses: [
       { resourceId: flagshipResourceId, status: 'active', turnsUntilRenewal: 5, unitsProducedThisPeriod: 0 },
     ],
-    licenseSlots: RIVAL_LICENSE_SLOTS,
     knownRecipeIds: new Set(baseKnownIds),
     postedPrices: { [flagshipResourceId]: flagshipResource.basePrice },
     unitCost: { [flagshipResourceId]: Math.round(flagshipResource.basePrice * 0.75) },
@@ -92,7 +89,6 @@ export function newGame(scenario: ScenarioConfig, seed: number): GameState {
     reputation: 50,
     inventory: {},
     licenses: [makeStartingLicense(scenario)],
-    licenseSlots: 1,
     facilities: [makeStartingFacility(scenario)],
     knowledge: {
       knownRecipeIds: new Set(scenario.startingKnownRecipeIds),
