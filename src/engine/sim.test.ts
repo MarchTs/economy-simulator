@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { breweryScenario } from '../scenarios/simScenarios';
 import {
   applyCommand,
+  CLICK_BOOST_SECONDS,
   CONTRACTS_PER_MANAGER,
   facilityRatePerSec,
   LOAN_OFFERS,
@@ -68,6 +69,28 @@ describe('production (per-second clock)', () => {
     expect(s.inventory['malt'] ?? 0).toBeGreaterThan(0);
     // and barley was consumed (2 per malt)
     expect(s.inventory['barley'] ?? 0).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('click boost', () => {
+  it('tapping a facility instantly makes CLICK_BOOST_SECONDS worth of its output', () => {
+    let s = newGame(S, { seed: 1 });
+    const f = s.facilities[0];
+    const expected = Math.max(1, Math.round(facilityRatePerSec(f, S) * CLICK_BOOST_SECONDS));
+    s = cmd(s, { kind: 'clickBoost', facilityId: f.id });
+    expect(s.inventory['barley']).toBe(expected);
+    expect(expected).toBeGreaterThan(1); // a tap must feel worth doing
+  });
+
+  it('a boost still respects missing inputs', () => {
+    let s = newGame(S, { seed: 1 });
+    s.cash = 100000;
+    s.firstSaleMade = true;
+    s = cmd(s, { kind: 'buildFacility', facilityType: 'malthouse' });
+    const malt = s.facilities.find((f) => f.type === 'malthouse')!;
+    s.inventory['barley'] = 0; // no input on hand
+    s = cmd(s, { kind: 'clickBoost', facilityId: malt.id });
+    expect(s.inventory['malt'] ?? 0).toBe(0);
   });
 });
 

@@ -2,7 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
 import {
   applyCommand,
+  CLICK_BOOST_SECONDS,
   CONTRACTS_PER_MANAGER,
+  estimateOutputPerCycle,
   facilityRatePerSec,
   facilityTypeDef,
   facilityUpkeep,
@@ -16,6 +18,7 @@ import {
   SETTLE_INTERVAL_SEC,
   speculationPnL,
   tickSecond,
+  unitMargin,
   unlockedTier,
   upkeepTotal,
   ACCOUNTANT_SALARY,
@@ -66,10 +69,21 @@ export default function App() {
   return <Game key={pick.scenario.id + pick.sandbox} scenario={pick.scenario} sandbox={pick.sandbox} onExit={() => setPick(null)} />;
 }
 
+// Notification centre filters. 'all' plus one per notification category —
+// opportunities are offers you may take; the rest are obligations due now.
+type NotifFilter = 'all' | 'opportunity' | 'delivery' | 'installment' | 'taxPayment';
+const NOTIF_FILTERS: { id: NotifFilter; label: string }[] = [
+  { id: 'all', label: 'All' },
+  { id: 'opportunity', label: 'Offers' },
+  { id: 'delivery', label: 'Deliveries' },
+  { id: 'installment', label: 'Loans' },
+  { id: 'taxPayment', label: 'Tax' },
+];
+
 type Tab = 'production' | 'market' | 'bank' | 'managers' | 'gold' | 'log';
 const TABS: { id: Tab; label: string }[] = [
-  { id: 'production', label: 'Production' },
   { id: 'market', label: 'Market' },
+  { id: 'production', label: 'Production' },
   { id: 'bank', label: 'Bank' },
   { id: 'managers', label: 'Managers' },
   { id: 'gold', label: 'Gold' },
@@ -80,8 +94,9 @@ function Game({ scenario, sandbox, onExit }: { scenario: ScenarioConfig; sandbox
   const [state, setState] = useState<GameState>(() => newGame(scenario, { seed: SEED, sandbox }));
   const [speed, setSpeed] = useState(1);
   const [paused, setPaused] = useState(false);
-  const [tab, setTab] = useState<Tab>('production');
+  const [tab, setTab] = useState<Tab>('market');
   const [goldQty, setGoldQty] = useState(1);
+  const [notifFilter, setNotifFilter] = useState<NotifFilter>('all');
 
   const speedRef = useRef(speed);
   speedRef.current = speed;
@@ -117,11 +132,52 @@ function Game({ scenario, sandbox, onExit }: { scenario: ScenarioConfig; sandbox
 
   const cmd = (c: Command) => setState((s) => applyCommand(s, c, scenario));
 
+  // Clicker juice: tapping a building makes product now and floats a "+N" at
+  // the cursor. The pop is pure UI (never engine state) so it can't affect the sim.
+  const [pops, setPops] = useState<{ id: number; x: number; y: number; text: string }[]>([]);
+  const popId = useRef(0);
+  function handleBoost(facilityId: string, e: React.MouseEvent) {
+    // The state updater must stay PURE — StrictMode double-invokes it, so any
+    // side effect in there fires twice. Predict the pop text from render-scope
+    // state (at most one 120ms frame stale, fine for a cosmetic number) and do
+    // the actual boost through a clean functional update.
+    const f = state.facilities.find((x) => x.id === facilityId);
+    let made = 0;
+    if (f) {
+      made = Math.max(1, Math.round(facilityRatePerSec(f, scenario) * CLICK_BOOST_SECONDS));
+      for (const inp of productById(scenario, f.productId).inputs) {
+        made = Math.min(made, Math.floor((state.inventory[inp.id] ?? 0) / inp.qty));
+      }
+    }
+    setState((s) => applyCommand(s, { kind: 'clickBoost', facilityId }, scenario));
+
+    const id = popId.current++;
+    setPops((p) => [...p.slice(-14), { id, x: e.clientX, y: e.clientY, text: made > 0 ? `+${made}` : 'no inputs' }]);
+    setTimeout(() => setPops((p) => p.filter((q) => q.id !== id)), 750);
+  }
+
   const nw = useMemo(() => netWorth(state), [state]);
   const secToSettle = SETTLE_INTERVAL_SEC - (state.clockSec % SETTLE_INTERVAL_SEC);
   const goalPct = state.runGoal ? Math.min(100, (nw / state.runGoal.targetNetWorth) * 100) : 0;
   const timeLeft = state.runGoal ? Math.max(0, state.runGoal.timeLimitSec - state.clockSec) : 0;
   const incomePerCycle = estimateIncomePerCycle(state, scenario);
+
+  const notifCounts: Record<NotifFilter, number> = useMemo(() => {
+    const byKind = (k: string) => state.pendingObligations.filter((o) => o.kind === k).length;
+    return {
+      all: state.opportunities.length + state.pendingObligations.length,
+      opportunity: state.opportunities.length,
+      delivery: byKind('delivery'),
+      installment: byKind('installment'),
+      taxPayment: byKind('taxPayment'),
+    };
+  }, [state.opportunities, state.pendingObligations]);
+  const notifTotal = notifCounts.all;
+  const visibleOpportunities = notifFilter === 'all' || notifFilter === 'opportunity' ? state.opportunities : [];
+  const visibleObligations =
+    notifFilter === 'all' ? state.pendingObligations
+    : notifFilter === 'opportunity' ? []
+    : state.pendingObligations.filter((o) => o.kind === notifFilter);
 
   return (
     <div className="game">
@@ -129,6 +185,11 @@ function Game({ scenario, sandbox, onExit }: { scenario: ScenarioConfig; sandbox
         <div className="brand-block">
           <span className="brand-sm">Owe &amp; Grow</span>
           <span className="scenario-tag">{scenario.name}</span>
+        </div>
+
+        <div className="cash-block">
+          <span className="cash-label">Cash</span>
+          <span className="cash-value">{fmt(state.cash)}g</span>
         </div>
 
         <div className="goal-block">
@@ -145,10 +206,6 @@ function Game({ scenario, sandbox, onExit }: { scenario: ScenarioConfig; sandbox
         </div>
 
         <div className="stat-cluster">
-          <div className="stat">
-            <span className="stat-label">Cash</span>
-            <span className="stat-value">{fmt(state.cash)}g</span>
-          </div>
           <div className="stat">
             <span className="stat-label">{sandbox ? 'Elapsed' : 'Time left'}</span>
             <span className="stat-value">{sandbox ? mmss(state.clockSec) : mmss(timeLeft)}</span>
@@ -178,29 +235,55 @@ function Game({ scenario, sandbox, onExit }: { scenario: ScenarioConfig; sandbox
 
       <div className="main">
         <section className="ops-col">
-          <h2 className="col-head">Due now</h2>
+          <div className="col-head-row">
+            <h2 className="col-head">Notifications</h2>
+            {notifTotal > 0 && <span className="notif-total">{notifTotal}</span>}
+          </div>
+          <div className="notif-filters">
+            {NOTIF_FILTERS.map((f) => (
+              <button
+                key={f.id}
+                className={`notif-chip ${notifFilter === f.id ? 'active' : ''}`}
+                onClick={() => setNotifFilter(f.id)}
+              >
+                {f.label}
+                {notifCounts[f.id] > 0 && <span className="notif-count">{notifCounts[f.id]}</span>}
+              </button>
+            ))}
+          </div>
           <div className="ops-scroll">
-            {state.pendingObligations.length === 0 && state.opportunities.length === 0 && (
-              <p className="all-clear">All clear — production is humming. Sell surplus, expand, or wait for the next cycle.</p>
+            {visibleOpportunities.length === 0 && visibleObligations.length === 0 && (
+              <p className="all-clear">
+                {notifTotal === 0
+                  ? 'All clear — production is humming. Sell surplus, expand, or wait for the next cycle.'
+                  : `Nothing in ${NOTIF_FILTERS.find((f) => f.id === notifFilter)?.label}. Other notifications are waiting under All.`}
+              </p>
             )}
 
-            {state.opportunities.map((o) => (
-              <div key={o.id} className="offer-card">
-                <div className="offer-head">
-                  <span className="offer-tag">Opportunity</span>
-                  <span className="offer-expire">{o.expiresInSec}s</span>
+            {visibleOpportunities.map((o) => {
+              const output = Math.round(estimateOutputPerCycle(state, scenario, o.productId));
+              const canSupply = output >= o.qtyPerCycle;
+              return (
+                <div key={o.id} className="offer-card">
+                  <div className="offer-head">
+                    <span className="offer-tag">Opportunity</span>
+                    <span className="offer-expire">{o.expiresInSec}s</span>
+                  </div>
+                  <p className="offer-body">
+                    <b>{o.customer}</b> wants <b>{o.qtyPerCycle} {productById(scenario, o.productId).name}</b> / cycle @ {o.pricePerUnit}g
+                    <span className="offer-sub"> for {o.durationCycles} cycles</span>
+                  </p>
+                  <p className={`offer-supply ${canSupply ? 'ok' : 'short'}`}>
+                    needs {o.qtyPerCycle}/cycle · you make ~{output}/cycle{canSupply ? '' : ' — expand to fill it'}
+                  </p>
+                  <button className="primary" onClick={() => cmd({ kind: 'acceptOpportunity', offerId: o.id })}>
+                    Sign · earn {fmt(o.qtyPerCycle * o.pricePerUnit)}g/cycle
+                  </button>
                 </div>
-                <p className="offer-body">
-                  <b>{o.customer}</b> wants <b>{o.qtyPerCycle} {productById(scenario, o.productId).name}</b> / cycle @ {o.pricePerUnit}g
-                  <span className="offer-sub"> for {o.durationCycles} cycles</span>
-                </p>
-                <button className="primary" onClick={() => cmd({ kind: 'acceptOpportunity', offerId: o.id })}>
-                  Sign · {fmt(o.qtyPerCycle * o.pricePerUnit)}g/cycle
-                </button>
-              </div>
-            ))}
+              );
+            })}
 
-            {state.pendingObligations.map((o) => {
+            {visibleObligations.map((o) => {
               const canDo =
                 o.kind === 'delivery'
                   ? (state.inventory[o.productId] ?? 0) >= o.qty
@@ -250,7 +333,7 @@ function Game({ scenario, sandbox, onExit }: { scenario: ScenarioConfig; sandbox
           </div>
 
           <div className="panel-body">
-            {tab === 'production' && <ProductionTab state={state} scenario={scenario} cmd={cmd} />}
+            {tab === 'production' && <ProductionTab state={state} scenario={scenario} cmd={cmd} onBoost={handleBoost} />}
             {tab === 'market' && <MarketTab state={state} scenario={scenario} cmd={cmd} />}
             {tab === 'bank' && <BankTab state={state} cmd={cmd} incomePerCycle={incomePerCycle} />}
             {tab === 'managers' && <ManagersTab state={state} cmd={cmd} />}
@@ -269,6 +352,10 @@ function Game({ scenario, sandbox, onExit }: { scenario: ScenarioConfig; sandbox
         ))}
       </footer>
 
+      {pops.map((p) => (
+        <span key={p.id} className="click-pop" style={{ left: p.x, top: p.y }}>{p.text}</span>
+      ))}
+
       {state.outcome && (
         <EndReport state={state} scenario={scenario} onExit={onExit} onReplay={() => setState(newGame(scenario, { seed: SEED + state.cycle, sandbox }))} />
       )}
@@ -281,60 +368,117 @@ function estimateIncomePerCycle(state: GameState, scenario: ScenarioConfig): num
   return contractIncome - managerSalaryTotal(state) - upkeepTotal(state, scenario);
 }
 
-function ProductionTab({ state, scenario, cmd }: { state: GameState; scenario: ScenarioConfig; cmd: (c: Command) => void }) {
+// Emoji per facility type — a cheap way to give each grid tile a distinct
+// silhouette you can recognise at a glance, RTS-style.
+const FACILITY_ICON: Record<string, string> = {
+  farm: '🌾', hop_yard: '🌿', glassworks: '🫙', malthouse: '🏚️', brewery: '🍺', packaging_plant: '📦',
+  wheat_farm: '🌾', henhouse: '🥚', sugar_mill: '🍬', mill: '🌀', kitchen: '🎂', cake_shop: '🍰',
+};
+
+function ProductionTab({
+  state,
+  scenario,
+  cmd,
+  onBoost,
+}: {
+  state: GameState;
+  scenario: ScenarioConfig;
+  cmd: (c: Command) => void;
+  onBoost: (facilityId: string, e: React.MouseEvent) => void;
+}) {
   const tier = unlockedTier(state, scenario);
+  const buildable = scenario.facilityTypes.filter((def) => productById(scenario, def.productId).tier <= tier);
+  const locked = scenario.facilityTypes.filter((def) => productById(scenario, def.productId).tier > tier);
+
   return (
     <>
-      <h3 className="sub">Your facilities</h3>
-      <div className="table-scroll">
-        <table>
-          <thead>
-            <tr><th>Facility</th><th className="num">Level</th><th className="num">Rate</th><th className="num">Upkeep</th><th></th></tr>
-          </thead>
-          <tbody>
-            {state.facilities.map((f) => {
-              const def = facilityTypeDef(scenario, f.type);
-              const up = levelUpCost(f, scenario);
-              return (
-                <tr key={f.id}>
-                  <td>{def.name}<span className="makes">→ {productById(scenario, f.productId).name}</span></td>
-                  <td className="num">L{f.level}</td>
-                  <td className="num">{facilityRatePerSec(f, scenario).toFixed(1)}/s</td>
-                  <td className="num">{fmt(facilityUpkeep(f, scenario))}g</td>
-                  <td className="row-actions">
-                    <button disabled={state.cash < up} onClick={() => cmd({ kind: 'levelUpFacility', facilityId: f.id })}>Up · {fmt(up)}g</button>
-                    <button onClick={() => cmd({ kind: 'sellFacility', facilityId: f.id })}>Sell</button>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+      <div className="grid-head">
+        <h3 className="sub">Your base</h3>
+        <span className="grid-hint">Tap a building to work it by hand</span>
       </div>
 
-      <h3 className="sub">Build new</h3>
-      <p className="hint">Unlocked up to tier {tier}. Higher tiers unlock as you make your first sale and level facilities to L2.</p>
-      <div className="build-grid">
-        {scenario.facilityTypes.map((def) => {
-          const product = productById(scenario, def.productId);
-          const locked = product.tier > tier;
+      <div className="rts-grid">
+        {state.facilities.map((f) => {
+          const def = facilityTypeDef(scenario, f.type);
+          const product = productById(scenario, f.productId);
+          const up = levelUpCost(f, scenario);
+          const perCycle = facilityRatePerSec(f, scenario) * SETTLE_INTERVAL_SEC;
+          const margin = unitMargin(state, scenario, f.productId);
+          const price = state.market[f.productId].price;
+          const marginPct = price > 0 ? (margin / price) * 100 : 0;
+          const held = state.inventory[f.productId] ?? 0;
+          // f.accumulator is the fractional unit in progress — a natural progress bar.
+          const progress = Math.min(1, f.accumulator % 1);
+          const starved = product.inputs.some((i) => (state.inventory[i.id] ?? 0) < i.qty);
+
+          return (
+            <div
+              key={f.id}
+              className={`rts-tile ${starved ? 'starved' : ''}`}
+              onClick={(e) => onBoost(f.id, e)}
+              title={`Tap to make ~${Math.max(1, Math.round(facilityRatePerSec(f, scenario)))} ${product.name}`}
+            >
+              <div className="tile-top">
+                <span className="tile-icon">{FACILITY_ICON[f.type] ?? '🏭'}</span>
+                <span className="tile-lvl">L{f.level}</span>
+              </div>
+              <div className="tile-name">{def.name}</div>
+              <div className="tile-product">
+                {product.name} <b>{fmt(held)}</b>
+              </div>
+              <div className="tile-bar"><div className="tile-fill" style={{ width: `${progress * 100}%` }} /></div>
+              <div className="tile-stats">
+                <span>{perCycle.toFixed(0)}/cyc</span>
+                <span className={margin > 0 ? 'up' : margin < 0 ? 'down' : 'muted'}>
+                  {margin >= 0 ? '+' : ''}{marginPct.toFixed(0)}%
+                </span>
+                <span className="tile-upkeep">−{fmt(facilityUpkeep(f, scenario))}g</span>
+              </div>
+              {starved && <div className="tile-starved">needs inputs</div>}
+              <div className="tile-actions" onClick={(e) => e.stopPropagation()}>
+                <button disabled={state.cash < up} onClick={() => cmd({ kind: 'levelUpFacility', facilityId: f.id })}>
+                  ⬆ {fmt(up)}g
+                </button>
+                <button onClick={() => cmd({ kind: 'sellFacility', facilityId: f.id })}>Sell</button>
+              </div>
+            </div>
+          );
+        })}
+
+        {buildable.map((def) => {
           const blocked = state.taxDebt > 0;
           const afford = state.cash >= def.buildCost;
           return (
             <button
-              key={def.type}
-              className="build-btn"
-              disabled={locked || blocked || !afford}
+              key={`build-${def.type}`}
+              className="rts-tile build-slot"
+              disabled={blocked || !afford}
               onClick={() => cmd({ kind: 'buildFacility', facilityType: def.type })}
-              title={locked ? `Unlocks at tier ${product.tier}` : blocked ? 'Clear tax debt first' : ''}
+              title={blocked ? 'Clear tax debt first' : !afford ? 'Not enough cash' : `Build a ${def.name}`}
             >
-              <span className="build-name">{def.name}</span>
-              <span className="build-tier">T{product.tier}</span>
-              <span className="build-cost">{locked ? '🔒 locked' : `${fmt(def.buildCost)}g`}</span>
+              <span className="slot-plus">+</span>
+              <span className="slot-icon">{FACILITY_ICON[def.type] ?? '🏭'}</span>
+              <span className="slot-name">{def.name}</span>
+              <span className="slot-cost">{fmt(def.buildCost)}g</span>
             </button>
           );
         })}
+
+        {locked.map((def) => {
+          const product = productById(scenario, def.productId);
+          return (
+            <div key={`locked-${def.type}`} className="rts-tile locked-slot" title={`Unlocks at tier ${product.tier}`}>
+              <span className="slot-lock">🔒</span>
+              <span className="slot-name">{def.name}</span>
+              <span className="slot-cost">tier {product.tier}</span>
+            </div>
+          );
+        })}
       </div>
+
+      <p className="hint">
+        Unlocked to tier {tier}. Sell something to reach tier 1; take a building to L2 to unlock the tier above it.
+      </p>
     </>
   );
 }

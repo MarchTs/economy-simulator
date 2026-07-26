@@ -175,6 +175,10 @@ export const CONTRACT_PREMIUM = 1.25; // contract sell price vs spot
 export const SPOT_SELL_FACTOR = 1.0; // spot sells at market price
 export const HISTORY_CAP = 240;
 export const LEVELUP_COST_FACTOR = 0.6; // level-up cost = buildCost * factor * level
+// Tapping a facility instantly makes this many seconds' worth of its output.
+// Deliberately small: mashing is a real early-game boost, but becomes
+// irrelevant once facilities scale — the classic clicker arc.
+export const CLICK_BOOST_SECONDS = 3;
 export const RUN_TARGET_NET_WORTH = 1_000_000;
 export const RUN_TIME_LIMIT_SEC = 3600; // one game-hour
 
@@ -244,6 +248,16 @@ export function facilityUpkeep(f: Facility, scenario: ScenarioConfig): number {
 
 export function levelUpCost(f: Facility, scenario: ScenarioConfig): number {
   return Math.round(facilityTypeDef(scenario, f.type).buildCost * LEVELUP_COST_FACTOR * f.level);
+}
+
+// Per-unit margin at current market prices: the product's spot price minus the
+// spot cost of its inputs. For a raw product (no inputs) that's the full price.
+// This is the value a facility adds per unit it makes.
+export function unitMargin(state: GameState, scenario: ScenarioConfig, productId: string): number {
+  const def = productById(scenario, productId);
+  const revenue = state.market[productId].price;
+  const inputCost = def.inputs.reduce((s, inp) => s + inp.qty * (state.market[inp.id]?.price ?? 0), 0);
+  return revenue - inputCost;
 }
 
 // The highest tier the player may build into yet. Tier 0 always; tier N unlocks
@@ -702,6 +716,7 @@ function advanceGold(state: GameState) {
 // ---------------------------------------------------------------------------
 
 export type Command =
+  | { kind: 'clickBoost'; facilityId: string }
   | { kind: 'spotSell'; productId: string; qty: number }
   | { kind: 'spotBuy'; productId: string; qty: number }
   | { kind: 'buildFacility'; facilityType: string }
@@ -723,6 +738,13 @@ export function applyCommand(prev: GameState, cmd: Command, scenario: ScenarioCo
   if (state.outcome) return state;
 
   switch (cmd.kind) {
+    case 'clickBoost': {
+      const f = state.facilities.find((x) => x.id === cmd.facilityId);
+      if (!f) break;
+      const want = Math.max(1, Math.round(facilityRatePerSec(f, scenario) * CLICK_BOOST_SECONDS));
+      produceUpTo(state, scenario, f.productId, want);
+      break;
+    }
     case 'spotSell': {
       const have = state.inventory[cmd.productId] ?? 0;
       const qty = Math.min(cmd.qty, have);
