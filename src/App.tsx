@@ -1,1184 +1,702 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
-import { makeDiscoveryChecker } from './engine/discovery';
-import { newGame } from './engine/newGame';
-import { buildRecipeTree } from './engine/recipeTree';
 import {
   applyCommand,
-  effectiveCapacity,
-  estimateBills,
-  estimateRecipeSalePrice,
-  estimateResourceRate,
-  ingredientResearchCost,
+  CLICK_BOOST_SECONDS,
+  CONTRACTS_PER_MANAGER,
+  estimateOutputPerCycle,
+  facilityRatePerSec,
+  facilityTypeDef,
+  facilityUpkeep,
+  goldValue,
   levelUpCost,
-  levelUpDuration,
-  loanCreditLimit,
-  LOAN_TERM_TURNS,
-  MAX_FACILITY_LEVEL,
-  outstandingDebt,
-  tick,
+  LOAN_OFFERS,
+  managerSalaryTotal,
+  netWorth,
+  newGame,
+  productById,
+  SETTLE_INTERVAL_SEC,
+  speculationPnL,
+  tickSecond,
+  unitMargin,
+  unlockedTier,
+  upkeepTotal,
+  ACCOUNTANT_SALARY,
+  FINANCE_SALARY,
+  SHIPPING_SALARY,
   type Command,
-} from './engine/reducer';
-import type { GameState, ResourceId } from './engine/types';
-import { bakeryScenario } from './scenarios/bakery/config';
-import { breweryScenario } from './scenarios/brewery/config';
-import type { ScenarioConfig } from './scenarios/types';
-import { MarketIntelView, type MarketIntel } from './ui/MarketIntelView';
+  type GameState,
+  type ScenarioConfig,
+} from './engine/sim';
+import { SCENARIOS } from './scenarios/simScenarios';
 import { PriceChart } from './ui/PriceChart';
-import { RecipeTreeView } from './ui/RecipeTreeView';
 
-const SCENARIOS: { config: ScenarioConfig; blurb: string }[] = [
-  { config: breweryScenario, blurb: 'License politics & production chains — barley to bottled beer. Higher capex, harder license gates.' },
-  { config: bakeryScenario, blurb: 'The tutorial track — cheap licenses, low capex, and the only scenario where unsold stock spoils.' },
-];
 const SEED = 1234;
+const fmt = (n: number) => Math.round(n).toLocaleString();
+const mmss = (sec: number) => {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+};
 
-type Tab = 'licenses' | 'research' | 'facilities' | 'contracts' | 'bank' | 'payments' | 'defenses' | 'leaderboard' | 'log';
+export default function App() {
+  const [pick, setPick] = useState<{ scenario: ScenarioConfig; sandbox: boolean } | null>(null);
 
+  if (!pick) {
+    return (
+      <div className="picker">
+        <h1 className="brand">Owe &amp; Grow</h1>
+        <p className="tagline">Grow a business. Borrow to grow faster — if you can carry the payments.</p>
+        <div className="scenario-cards">
+          {SCENARIOS.map((s) => (
+            <div key={s.id} className="scenario-card">
+              <h2>{s.name}</h2>
+              <p>{s.blurb}</p>
+              <div className="scenario-actions">
+                <button className="primary" onClick={() => setPick({ scenario: s, sandbox: false })}>
+                  Race to 1,000,000g
+                </button>
+                <button onClick={() => setPick({ scenario: s, sandbox: true })}>Sandbox</button>
+              </div>
+            </div>
+          ))}
+        </div>
+        <p className="picker-note">Reach one million net worth within a game-hour. A pure saver can't — that's the lesson.</p>
+      </div>
+    );
+  }
+
+  return <Game key={pick.scenario.id + pick.sandbox} scenario={pick.scenario} sandbox={pick.sandbox} onExit={() => setPick(null)} />;
+}
+
+// Notification centre filters. 'all' plus one per notification category —
+// opportunities are offers you may take; the rest are obligations due now.
+type NotifFilter = 'all' | 'opportunity' | 'delivery' | 'installment' | 'taxPayment';
+const NOTIF_FILTERS: { id: NotifFilter; label: string }[] = [
+  { id: 'all', label: 'All' },
+  { id: 'opportunity', label: 'Offers' },
+  { id: 'delivery', label: 'Deliveries' },
+  { id: 'installment', label: 'Loans' },
+  { id: 'taxPayment', label: 'Tax' },
+];
+
+type Tab = 'production' | 'market' | 'bank' | 'managers' | 'gold' | 'log';
 const TABS: { id: Tab; label: string }[] = [
-  { id: 'licenses', label: 'Licenses' },
-  { id: 'research', label: 'Research' },
-  { id: 'facilities', label: 'Facilities' },
-  { id: 'contracts', label: 'Contracts' },
+  { id: 'market', label: 'Market' },
+  { id: 'production', label: 'Production' },
   { id: 'bank', label: 'Bank' },
-  { id: 'payments', label: 'Payments' },
-  { id: 'defenses', label: 'Defenses' },
-  { id: 'leaderboard', label: 'Leaderboard' },
+  { id: 'managers', label: 'Managers' },
+  { id: 'gold', label: 'Gold' },
   { id: 'log', label: 'Log' },
 ];
 
-function App() {
-  const [scenario, setScenario] = useState<ScenarioConfig | null>(null);
-
-  if (!scenario) {
-    return (
-      <div className="scenario-picker">
-        <h1>License Economy</h1>
-        <p className="muted">Choose a scenario to play.</p>
-        <div className="scenario-cards">
-          {SCENARIOS.map((s) => (
-            <button key={s.config.id} className="scenario-card" onClick={() => setScenario(s.config)}>
-              <h2>{s.config.name}</h2>
-              <p>{s.blurb}</p>
-            </button>
-          ))}
-        </div>
-      </div>
-    );
-  }
-
-  return <Game key={scenario.id} scenario={scenario} onExit={() => setScenario(null)} />;
-}
-
-function Game({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => void }) {
-  function resourceName(id: ResourceId): string {
-    return scenario.resources.find((r) => r.id === id)?.name ?? id;
-  }
-
-  const [state, setState] = useState<GameState>(() => newGame(scenario, SEED));
-  const [tab, setTab] = useState<Tab>('licenses');
-  const [treeResource, setTreeResource] = useState<ResourceId | null>(null);
-  const [intelResource, setIntelResource] = useState<ResourceId | null>(null);
-  const [showAllMarket, setShowAllMarket] = useState(false);
-  const [researchPick, setResearchPick] = useState<ResourceId[]>([]);
-  const [targetTier, setTargetTier] = useState(1);
-  const [supplyForm, setSupplyForm] = useState({
-    side: 'sell' as 'sell' | 'buy',
-    resourceId: scenario.resources[0].id,
-    qtyPerTurn: 5,
-    price: scenario.resources[0].basePrice,
-    turnsLeft: 5,
-  });
-  const [buildForm, setBuildForm] = useState(() => {
-    const isDiscoveredAtStart = makeDiscoveryChecker(state);
-    const facilityType =
-      scenario.facilityTypes.find((f) => scenario.resources.some((r) => r.facility === f.type && isDiscoveredAtStart(r.id)))?.type ??
-      scenario.facilityTypes[0].type;
-    const resourceId = (
-      scenario.resources.find((r) => r.facility === facilityType && isDiscoveredAtStart(r.id)) ??
-      scenario.resources.find((r) => r.facility === facilityType)!
-    ).id;
-    return { facilityType, resourceId };
-  });
-  const [borrowAmount, setBorrowAmount] = useState(500);
+function Game({ scenario, sandbox, onExit }: { scenario: ScenarioConfig; sandbox: boolean; onExit: () => void }) {
+  const [state, setState] = useState<GameState>(() => newGame(scenario, { seed: SEED, sandbox }));
+  const [speed, setSpeed] = useState(1);
+  const [paused, setPaused] = useState(false);
+  const [tab, setTab] = useState<Tab>('market');
   const [goldQty, setGoldQty] = useState(1);
-  const [logFilter, setLogFilter] = useState('');
+  const [notifFilter, setNotifFilter] = useState<NotifFilter>('all');
 
-  // Drag-to-resize the Market/Tabs column split. null = default 6:5 flex ratio
-  // from CSS; once the user drags, marketColWidth pins the left panel to a
-  // fixed pixel width and the right panel (still flex:5) fills the rest.
-  const mainRef = useRef<HTMLDivElement>(null);
-  const [marketColWidth, setMarketColWidth] = useState<number | null>(null);
-  const resizingRef = useRef(false);
+  const speedRef = useRef(speed);
+  speedRef.current = speed;
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused || !!state.outcome;
 
+  // Real-time loop: advance game-seconds at the current speed. 1 game-second =
+  // 1 real second at x1. tickSecond internally settles every 30 game-seconds.
   useEffect(() => {
-    function onMove(e: MouseEvent) {
-      if (!resizingRef.current || !mainRef.current) return;
-      const rect = mainRef.current.getBoundingClientRect();
-      const min = 220;
-      const max = rect.width - 300;
-      setMarketColWidth(Math.min(max, Math.max(min, e.clientX - rect.left)));
-    }
-    function onUp() {
-      if (!resizingRef.current) return;
-      resizingRef.current = false;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-    }
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-  }, []);
-
-  function startColResize() {
-    resizingRef.current = true;
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-  }
-
-  const [prevPrices, setPrevPrices] = useState<Record<string, number>>({});
-  const [flash, setFlash] = useState<string[]>([]); // recent event log lines
-  const ledgerSeen = useRef(1);
-
-  // Turn-based: nothing advances on its own. Capture pre-turn prices (for
-  // ▲▼ deltas) right before applying the turn, then call tick() once.
-  function endTurn() {
-    const snap: Record<string, number> = {};
-    for (const [id, e] of Object.entries(state.market)) snap[id] = e.price;
-    snap.__gold__ = state.goldPrice;
-    setPrevPrices(snap);
-    setState((cur) => (cur.gameOver ? cur : tick(cur, scenario)));
-  }
-
-  // Surface interesting new ledger entries as a short event feed.
-  useEffect(() => {
-    const fresh = state.ledger.slice(ledgerSeen.current);
-    ledgerSeen.current = state.ledger.length;
-    const interesting = fresh
-      .filter((e) => /discovered|granted|Spoiled|breach|lawsuit|Quest|suspend|lapsed|fire|spike|flood|failure|Gold rally|Gold crash/i.test(e.label))
-      .map((e) => e.label);
-    if (interesting.length) setFlash((f) => [...interesting, ...f].slice(0, 4));
-  }, [state.ledger]);
-
-  const netWorthBreakdown = useMemo(() => {
-    const facilityValue = state.player.facilities.reduce((sum, f) => {
-      const def = scenario.facilityTypes.find((d) => d.type === f.type)!;
-      return sum + def.buildCost * (f.condition / 100);
-    }, 0);
-    const invValue = Object.entries(state.player.inventory).reduce((sum, [id, e]) => {
-      const r = scenario.resources.find((res) => res.id === id);
-      return sum + (r ? r.basePrice * e.qty : 0);
-    }, 0);
-    const goldValue = state.player.goldHeld * state.goldPrice;
-    const debt = outstandingDebt(state.player);
-    const total = Math.round(state.player.cash + facilityValue + invValue + goldValue - debt);
-    return { cash: state.player.cash, facilityValue, invValue, goldValue, debt, total };
-  }, [state]);
-  const netWorth = netWorthBreakdown.total;
-
-  const leaderboard = useMemo(() => {
-    // Rivals in this engine only track cash (no facilities/inventory model),
-    // so their standing is cash-only — not a perfect apples-to-apples with
-    // the player's full net worth, but it's the best available comparison.
-    const entries = [
-      { name: 'You', isPlayer: true, standing: netWorth, reputation: state.player.reputation, licenses: state.player.licenses.length, personality: undefined as string | undefined },
-      ...state.rivals.map((r) => ({
-        name: r.name,
-        isPlayer: false,
-        standing: Math.round(r.cash),
-        reputation: r.reputation,
-        licenses: r.licenses.length,
-        personality: r.personality as string | undefined,
-      })),
-    ];
-    return entries.sort((a, b) => b.standing - a.standing);
-  }, [state, netWorth]);
-
-  const creditLimit = useMemo(() => loanCreditLimit(state.player, scenario), [state]);
-  const bills = useMemo(() => estimateBills(state, scenario), [state]);
-
-  const recipeTree = useMemo(() => {
-    if (!treeResource) return null;
-    return buildRecipeTree(treeResource, scenario.resources, state.recipes, state.market, state.player.knowledge.knownRecipeIds);
-  }, [treeResource, state]);
-
-  const marketIntel: MarketIntel | null = useMemo(() => {
-    if (!intelResource) return null;
-    const id = intelResource;
-    return {
-      resourceId: id,
-      resourceName: resourceName(id),
-      priceHistory: state.market[id].priceHistory,
-      currentTurn: state.turn,
-      boardQuests: state.contractBoard.filter((o) => o.resourceId === id),
-      boardStanding: state.standingOfferBoard.filter((o) => o.resourceId === id),
-      myQuests: state.player.questContracts.filter((c) => c.resourceId === id),
-      mySupply: state.player.supplyContracts.filter((c) => c.resourceId === id),
-      rivals: state.rivals
-        .map((rival) => ({
-          rival,
-          postedPrice: rival.postedPrices[id],
-          licensed: rival.licenses.some((l) => l.resourceId === id && l.status === 'active'),
-        }))
-        .filter((r) => r.postedPrice !== undefined || r.licensed),
-    };
-  }, [intelResource, state]);
-
-  const pendingDisclosure = useMemo(() => {
-    const pending = state.pendingDisclosures[0];
-    if (!pending) return null;
-    const recipe = state.recipes.find((r) => r.id === pending.recipeId);
-    if (!recipe) return null;
-    const resource = scenario.resources.find((r) => r.id === recipe.output)!;
-    return { recipe, resource, salePrice: estimateRecipeSalePrice(resource), queueLength: state.pendingDisclosures.length };
-  }, [state]);
-
-  const isDiscovered = useMemo(() => makeDiscoveryChecker(state), [state]);
-
-  const visibleResources = useMemo(() => {
-    if (showAllMarket) return scenario.resources;
-    return scenario.resources.filter((r) => isDiscovered(r.id));
-  }, [isDiscovered, showAllMarket]);
-  const hiddenCount = scenario.resources.length - visibleResources.length;
-
-  const visibleLicenses = useMemo(() => {
-    return scenario.licenses.filter((def) => isDiscovered(def.resourceId));
-  }, [isDiscovered]);
-  const hiddenLicenseCount = scenario.licenses.length - visibleLicenses.length;
-
-  const discoverableCount = useMemo(() => {
-    const known = state.player.knowledge.knownRecipeIds;
-    const isResourceKnown = (rid: ResourceId) => state.recipes.some((r) => r.output === rid && known.has(r.id));
-    return state.recipes.filter((r) => !known.has(r.id) && r.inputs.every((i) => isResourceKnown(i.ingredientId))).length;
-  }, [state]);
-
-  const knownResources = useMemo(() => {
-    const known = state.player.knowledge.knownRecipeIds;
-    return scenario.resources.filter((r) => state.recipes.some((rc) => rc.output === r.id && known.has(rc.id)));
-  }, [state]);
-
-  const availableTiers = useMemo(() => {
-    return [...new Set(scenario.resources.filter((r) => r.tier > 0).map((r) => r.tier))].sort((a, b) => a - b);
+    const acc = { ms: 0 };
+    let last = performance.now();
+    const id = setInterval(() => {
+      const now = performance.now();
+      const dt = now - last;
+      last = now;
+      if (pausedRef.current) return;
+      acc.ms += dt * speedRef.current;
+      let steps = 0;
+      while (acc.ms >= 1000 && steps < 30) {
+        acc.ms -= 1000;
+        steps += 1;
+      }
+      if (steps > 0) {
+        setState((prev) => {
+          let s = prev;
+          for (let i = 0; i < steps; i++) s = tickSecond(s, scenario);
+          return s;
+        });
+      }
+    }, 120);
+    return () => clearInterval(id);
   }, [scenario]);
 
-  const pickMatches = useMemo(() => {
-    if (researchPick.length === 0) return 0;
-    const known = state.player.knowledge.knownRecipeIds;
-    const chosen = new Set(researchPick);
-    return state.recipes.filter(
-      (r) =>
-        !known.has(r.id) &&
-        r.inputs.length > 0 &&
-        r.inputs.every((i) => chosen.has(i.ingredientId)) &&
-        scenario.resources.find((res) => res.id === r.output)?.tier === targetTier
-    ).length;
-  }, [researchPick, targetTier, state]);
+  const cmd = (c: Command) => setState((s) => applyCommand(s, c, scenario));
 
-  // Instant action: apply a command immediately and re-render.
-  function cmd(c: Command) {
-    setState((cur) => applyCommand(cur, c, scenario));
+  // Clicker juice: tapping a building makes product now and floats a "+N" at
+  // the cursor. The pop is pure UI (never engine state) so it can't affect the sim.
+  const [pops, setPops] = useState<{ id: number; x: number; y: number; text: string }[]>([]);
+  const popId = useRef(0);
+  function handleBoost(facilityId: string, e: React.MouseEvent) {
+    // The state updater must stay PURE — StrictMode double-invokes it, so any
+    // side effect in there fires twice. Predict the pop text from render-scope
+    // state (at most one 120ms frame stale, fine for a cosmetic number) and do
+    // the actual boost through a clean functional update.
+    const f = state.facilities.find((x) => x.id === facilityId);
+    let made = 0;
+    if (f) {
+      made = Math.max(1, Math.round(facilityRatePerSec(f, scenario) * CLICK_BOOST_SECONDS));
+      for (const inp of productById(scenario, f.productId).inputs) {
+        made = Math.min(made, Math.floor((state.inventory[inp.id] ?? 0) / inp.qty));
+      }
+    }
+    setState((s) => applyCommand(s, { kind: 'clickBoost', facilityId }, scenario));
+
+    const id = popId.current++;
+    setPops((p) => [...p.slice(-14), { id, x: e.clientX, y: e.clientY, text: made > 0 ? `+${made}` : 'no inputs' }]);
+    setTimeout(() => setPops((p) => p.filter((q) => q.id !== id)), 750);
   }
 
-  function toggleResearchPick(id: ResourceId) {
-    setResearchPick((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
-  }
+  const nw = useMemo(() => netWorth(state), [state]);
+  const secToSettle = SETTLE_INTERVAL_SEC - (state.clockSec % SETTLE_INTERVAL_SEC);
+  const goalPct = state.runGoal ? Math.min(100, (nw / state.runGoal.targetNetWorth) * 100) : 0;
+  const timeLeft = state.runGoal ? Math.max(0, state.runGoal.timeLimitSec - state.clockSec) : 0;
+  const incomePerCycle = estimateIncomePerCycle(state, scenario);
 
-  const activeCommission = state.player.knowledge.activeCommission;
-
-  if (state.gameOver) {
-    return (
-      <div className="game-over">
-        <h1>{state.gameOver.result === 'won' ? 'You won!' : state.gameOver.result === 'bankrupt' ? 'Bankrupt.' : 'Run ended.'}</h1>
-        <p className="muted">Ended at turn {state.gameOver.turn}. Final net worth: {netWorth}g</p>
-        <button onClick={onExit}>Choose a scenario</button>
-      </div>
-    );
-  }
-
-  function priceDelta(id: ResourceId, current: number) {
-    const prev = prevPrices[id];
-    if (prev === undefined || Math.abs(current - prev) < 0.05) return null;
-    const up = current > prev;
-    return <span className={up ? 'delta-up' : 'delta-down'}>{up ? '▲' : '▼'}{Math.abs(current - prev).toFixed(1)}</span>;
-  }
+  const notifCounts: Record<NotifFilter, number> = useMemo(() => {
+    const byKind = (k: string) => state.pendingObligations.filter((o) => o.kind === k).length;
+    return {
+      all: state.opportunities.length + state.pendingObligations.length,
+      opportunity: state.opportunities.length,
+      delivery: byKind('delivery'),
+      installment: byKind('installment'),
+      taxPayment: byKind('taxPayment'),
+    };
+  }, [state.opportunities, state.pendingObligations]);
+  const notifTotal = notifCounts.all;
+  const visibleOpportunities = notifFilter === 'all' || notifFilter === 'opportunity' ? state.opportunities : [];
+  const visibleObligations =
+    notifFilter === 'all' ? state.pendingObligations
+    : notifFilter === 'opportunity' ? []
+    : state.pendingObligations.filter((o) => o.kind === notifFilter);
 
   return (
     <div className="game">
-      <header className="hud">
-        <div className="title">
-          License Economy
-          <small>{scenario.name.toUpperCase()} · Turn {state.turn} / 60</small>
+      <header className="topbar">
+        <div className="brand-block">
+          <span className="brand-sm">Owe &amp; Grow</span>
+          <span className="scenario-tag">{scenario.name}</span>
         </div>
-        <div className="stat"><span className="label">Cash</span><span className="value">{Math.round(state.player.cash)}g</span></div>
-        <div className="stat net-worth-stat">
-          <span className="label">Net worth</span>
-          <span className="value">{netWorth}g</span>
-          <div className="net-worth-tooltip">
-            <div className="tooltip-row"><span>Cash</span><span>{Math.round(netWorthBreakdown.cash)}g</span></div>
-            <div className="tooltip-row"><span>Facilities <em>(at condition)</em></span><span>{Math.round(netWorthBreakdown.facilityValue)}g</span></div>
-            <div className="tooltip-row"><span>Inventory</span><span>{Math.round(netWorthBreakdown.invValue)}g</span></div>
-            <div className="tooltip-row"><span>Gold holdings</span><span>{Math.round(netWorthBreakdown.goldValue)}g</span></div>
-            <div className="tooltip-row"><span>− Outstanding debt</span><span>{Math.round(netWorthBreakdown.debt)}g</span></div>
-            <div className="tooltip-row total"><span>Net worth</span><span>{netWorth}g</span></div>
+
+        <div className="cash-block">
+          <span className="cash-label">Cash</span>
+          <span className="cash-value">{fmt(state.cash)}g</span>
+        </div>
+
+        <div className="goal-block">
+          <div className="goal-row">
+            <span className="nw-label">Net worth</span>
+            <span className="nw-value">{fmt(nw)}g</span>
+            {state.runGoal && <span className="goal-target">/ {fmt(state.runGoal.targetNetWorth)}g</span>}
+          </div>
+          {state.runGoal && (
+            <div className="goal-bar">
+              <div className="goal-fill" style={{ width: `${goalPct}%` }} />
+            </div>
+          )}
+        </div>
+
+        <div className="stat-cluster">
+          <div className="stat">
+            <span className="stat-label">{sandbox ? 'Elapsed' : 'Time left'}</span>
+            <span className="stat-value">{sandbox ? mmss(state.clockSec) : mmss(timeLeft)}</span>
           </div>
         </div>
-        <div className="stat"><span className="label">Reputation</span><span className="value">{Math.round(state.player.reputation)}</span></div>
-        <div className="stat"><span className="label">Licenses</span><span className="value">{state.player.licenses.length}</span></div>
 
-        <div className="effects">
-          {state.activeEffects.map((e) => (
-            <div key={e.id} className="effect-badge">{e.label} · {e.turnsLeft} turns</div>
+        <div className="clock-controls">
+          {[1, 1.5, 2].map((sp) => (
+            <button key={sp} className={`speed ${speed === sp ? 'active' : ''}`} onClick={() => setSpeed(sp)}>
+              {sp}×
+            </button>
           ))}
+          <button className="pause" onClick={() => setPaused((p) => !p)}>
+            {paused ? '▶' : '❚❚'}
+          </button>
+          <button onClick={onExit}>Quit</button>
         </div>
-
-        <button className="exit-btn" onClick={onExit} title="Abandon this run and pick a different scenario">Switch scenario</button>
       </header>
 
-      {state.pendingLawsuit && (
-        <div className="prompt-overlay">
-          <div className="prompt-card">
-            <h3>⚖ {state.pendingLawsuit.label}</h3>
-            <p className="muted">
-              Settle for {state.pendingLawsuit.settleCost}g, or fight — {Math.round(state.pendingLawsuit.fightWinChance * 100)}% chance
-              to win, losing costs {state.pendingLawsuit.fightLoseCost}g and reputation.
-            </p>
-            <div className="choices">
-              <button onClick={() => cmd({ kind: 'lawsuitDecision', decision: 'settle' })}>Settle</button>
-              <button onClick={() => cmd({ kind: 'lawsuitDecision', decision: 'fight' })}>Fight</button>
-            </div>
-            <p className="hint">You can resolve this whenever — it won't block ending your turn.</p>
-          </div>
+      <div className="settle-strip">
+        <span className="settle-label">Next settlement in {secToSettle}s</span>
+        <div className="settle-bar">
+          <div className="settle-fill" style={{ width: `${((SETTLE_INTERVAL_SEC - secToSettle) / SETTLE_INTERVAL_SEC) * 100}%` }} />
         </div>
-      )}
+        <span className="income-hint">~{fmt(incomePerCycle)}g income / cycle</span>
+      </div>
 
-      {pendingDisclosure && (
-        <div className="prompt-overlay">
-          <div className="prompt-card">
-            <h3>🔬 You discovered {pendingDisclosure.resource.name}!</h3>
-            <p className="muted">
-              Decide what happens to this recipe. Whatever you pick, you keep using it yourself either way.
-            </p>
-            <div className="choices disclosure-choices">
-              <button onClick={() => cmd({ kind: 'resolveDisclosure', choice: 'free' })}>
-                <strong>Publish free</strong>
-                <span className="desc">Public to every rival immediately. No reward, no downside.</span>
+      <div className="main">
+        <section className="ops-col">
+          <div className="col-head-row">
+            <h2 className="col-head">Notifications</h2>
+            {notifTotal > 0 && <span className="notif-total">{notifTotal}</span>}
+          </div>
+          <div className="notif-filters">
+            {NOTIF_FILTERS.map((f) => (
+              <button
+                key={f.id}
+                className={`notif-chip ${notifFilter === f.id ? 'active' : ''}`}
+                onClick={() => setNotifFilter(f.id)}
+              >
+                {f.label}
+                {notifCounts[f.id] > 0 && <span className="notif-count">{notifCounts[f.id]}</span>}
               </button>
-              <button onClick={() => cmd({ kind: 'resolveDisclosure', choice: 'exclusive' })}>
-                <strong>Stay exclusive (30 turns)</strong>
-                <span className="desc">Only you can make it — until the countdown ends, then it auto-publishes.</span>
-              </button>
-              <button onClick={() => cmd({ kind: 'resolveDisclosure', choice: 'sell' })}>
-                <strong>Sell privately (~{pendingDisclosure.salePrice}g)</strong>
-                <span className="desc">One rival pays for it and learns it. Stays secret from everyone else.</span>
-              </button>
-            </div>
-            {pendingDisclosure.queueLength > 1 && (
-              <p className="hint">{pendingDisclosure.queueLength - 1} more discovery decision(s) waiting after this one.</p>
+            ))}
+          </div>
+          <div className="ops-scroll">
+            {visibleOpportunities.length === 0 && visibleObligations.length === 0 && (
+              <p className="all-clear">
+                {notifTotal === 0
+                  ? 'All clear — production is humming. Sell surplus, expand, or wait for the next cycle.'
+                  : `Nothing in ${NOTIF_FILTERS.find((f) => f.id === notifFilter)?.label}. Other notifications are waiting under All.`}
+              </p>
             )}
-            <p className="hint">You can resolve this whenever — it won't block ending your turn.</p>
-          </div>
-        </div>
-      )}
 
-      <div className="main" ref={mainRef}>
-        <section className="panel market-col" style={marketColWidth != null ? { flex: `0 0 ${marketColWidth}px` } : undefined}>
-          <div className="panel-head market-head">
-            <h2>Market &amp; Inventory</h2>
-            <label className="show-all-toggle">
-              <input type="checkbox" checked={showAllMarket} onChange={(e) => setShowAllMarket(e.target.checked)} />
-              Show undiscovered{hiddenCount > 0 && !showAllMarket ? ` (${hiddenCount})` : ''}
-            </label>
+            {visibleOpportunities.map((o) => {
+              const output = Math.round(estimateOutputPerCycle(state, scenario, o.productId));
+              const canSupply = output >= o.qtyPerCycle;
+              return (
+                <div key={o.id} className="offer-card">
+                  <div className="offer-head">
+                    <span className="offer-tag">Opportunity</span>
+                    <span className="offer-expire">{o.expiresInSec}s</span>
+                  </div>
+                  <p className="offer-body">
+                    <b>{o.customer}</b> wants <b>{o.qtyPerCycle} {productById(scenario, o.productId).name}</b> / cycle @ {o.pricePerUnit}g
+                    <span className="offer-sub"> for {o.durationCycles} cycles</span>
+                  </p>
+                  <p className={`offer-supply ${canSupply ? 'ok' : 'short'}`}>
+                    needs {o.qtyPerCycle}/cycle · you make ~{output}/cycle{canSupply ? '' : ' — expand to fill it'}
+                  </p>
+                  <button className="primary" onClick={() => cmd({ kind: 'acceptOpportunity', offerId: o.id })}>
+                    Sign · earn {fmt(o.qtyPerCycle * o.pricePerUnit)}g/cycle
+                  </button>
+                </div>
+              );
+            })}
+
+            {visibleObligations.map((o) => {
+              const canDo =
+                o.kind === 'delivery'
+                  ? (state.inventory[o.productId] ?? 0) >= o.qty
+                  : state.cash >= o.amountG;
+              return (
+                <div key={o.id} className={`ob-card ob-${o.kind}`}>
+                  <p className="ob-label">{o.label}</p>
+                  <button
+                    className="primary"
+                    disabled={!canDo}
+                    onClick={() => cmd({ kind: 'resolveObligation', obligationId: o.id })}
+                  >
+                    {o.kind === 'delivery' ? `Ship · +${fmt(o.amountG)}g` : o.kind === 'installment' ? `Pay · ${fmt(o.amountG)}g` : `Pay tax · ${fmt(o.amountG)}g`}
+                  </button>
+                  {!canDo && <span className="ob-warn">{o.kind === 'delivery' ? 'not enough stock' : 'not enough cash'}</span>}
+                </div>
+              );
+            })}
           </div>
-          <div className="panel-body">
-            <table>
-              <thead>
-                <tr><th>Resource</th><th className="num">Price</th><th className="num">Held</th><th className="num">Rate</th><th className="num">Margin</th></tr>
-              </thead>
-              <tbody>
-                {visibleResources.map((r) => {
-                  const entry = state.market[r.id];
-                  const facility = state.player.facilities.find((f) => f.type === r.facility && f.buildTurnsLeft === 0);
-                  const on = state.player.autoProduce.includes(r.id);
-                  const rate = estimateResourceRate(state, scenario, r.id);
-                  const hasRate = rate.production > 0 || rate.ingredientUse.length > 0 || rate.sellContracts > 0 || rate.buyContracts > 0;
-                  const net = Math.round(rate.net);
-                  const licensed = state.player.licenses.some((l) => l.resourceId === r.id && l.status === 'active');
-                  const recipeForMargin = state.recipes.find((rec) => rec.output === r.id);
-                  const known = recipeForMargin !== undefined && state.player.knowledge.knownRecipeIds.has(recipeForMargin.id);
-                  const tree = licensed && known && facility
-                    ? buildRecipeTree(r.id, scenario.resources, state.recipes, state.market, state.player.knowledge.knownRecipeIds)
-                    : null;
-                  const margin = tree ? tree.buyDirectPrice - tree.rawMaterialCost : 0;
-                  const marginPct = tree && tree.rawMaterialCost > 0 ? (margin / tree.rawMaterialCost) * 100 : 0;
-                  return (
-                    <tr key={r.id} className="clickable-row" title="Click row for contracts & competitor intel"
-                      onClick={() => setIntelResource(r.id)}>
-                      <td className="cell-clip" title={`${r.name} — click for recipe tree`}>
-                        <button className="resource-link" onClick={(e) => { e.stopPropagation(); setTreeResource(r.id); }}>{r.name}</button>
-                        <span className="tier-chip">T{r.tier}</span>
-                      </td>
-                      <td className="num">{entry.price.toFixed(1)}g{priceDelta(r.id, entry.price)}</td>
-                      <td className="num">{state.player.inventory[r.id]?.qty ?? 0}</td>
-                      <td className="num hover-cell">
-                        {hasRate ? (
-                          <>
-                            <span className={net > 0 ? 'stat-up' : net < 0 ? 'stat-down' : 'muted'}>
-                              {net}/turn{facility && !on ? ' (off)' : ''}
-                            </span>
-                            <div className="hover-tooltip">
-                              {rate.production > 0 && (
-                                <div className="tooltip-row"><span>Production{on ? '' : ' (off)'}</span><span>+{Math.round(rate.production)}/turn</span></div>
-                              )}
-                              {rate.ingredientUse.map((u) => (
-                                <div className="tooltip-row" key={u.resourceId}>
-                                  <span>Used by {resourceName(u.resourceId)} <em>(ingredient)</em></span><span>−{Math.round(u.amount)}/turn</span>
-                                </div>
-                              ))}
-                              {rate.sellContracts > 0 && (
-                                <div className="tooltip-row"><span>Supply contract <em>(sell)</em></span><span>−{Math.round(rate.sellContracts)}/turn</span></div>
-                              )}
-                              {rate.buyContracts > 0 && (
-                                <div className="tooltip-row"><span>Supply contract <em>(buy)</em></span><span>+{Math.round(rate.buyContracts)}/turn</span></div>
-                              )}
-                              <div className="tooltip-row total"><span>Net</span><span>{net}/turn</span></div>
-                            </div>
-                          </>
-                        ) : '—'}
-                      </td>
-                      <td className="num hover-cell">
-                        {tree ? (
-                          <>
-                            <span className={margin > 0 ? 'stat-up' : margin < 0 ? 'stat-down' : 'muted'}>
-                              {margin >= 0 ? '+' : ''}{Math.round(margin)}g
-                            </span>
-                            <div className="hover-tooltip">
-                              <div className="tooltip-row"><span>Sell price</span><span>{Math.round(tree.buyDirectPrice)}g</span></div>
-                              <div className="tooltip-row"><span>Raw material cost</span><span>{Math.round(tree.rawMaterialCost)}g</span></div>
-                              <div className="tooltip-row total">
-                                <span>Margin</span><span>{margin >= 0 ? '+' : ''}{Math.round(margin)}g ({marginPct >= 0 ? '+' : ''}{marginPct.toFixed(0)}%)</span>
-                              </div>
-                            </div>
-                          </>
-                        ) : '—'}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+
+          {(state.loanArrears > 0 || state.taxDebt > 0) && (
+            <div className="arrears-box">
+              {state.loanArrears > 0 && (
+                <div className="arrears-row">
+                  <span>⚠ Loan arrears <b>{fmt(state.loanArrears)}g</b> — blocks new loans</span>
+                  <button disabled={state.cash <= 0} onClick={() => cmd({ kind: 'payArrears' })}>Pay</button>
+                </div>
+              )}
+              {state.taxDebt > 0 && (
+                <div className="arrears-row">
+                  <span>⚠ Tax debt <b>{fmt(state.taxDebt)}g</b> — blocks new facilities</span>
+                  <button disabled={state.cash <= 0} onClick={() => cmd({ kind: 'payTaxDebt' })}>Pay</button>
+                </div>
+              )}
+            </div>
+          )}
         </section>
 
-        <div className="col-resizer" onMouseDown={startColResize} />
-
-        <section className="panel tab-col">
+        <section className="panel-col">
           <div className="tabs">
             {TABS.map((t) => (
               <button key={t.id} className={`tab ${tab === t.id ? 'active' : ''}`} onClick={() => setTab(t.id)}>
                 {t.label}
-                {t.id === 'contracts' && state.contractBoard.length > 0 && <span className="badge">{state.contractBoard.length}</span>}
+                {t.id === 'production' && state.pendingObligations.length > 0 && <span className="badge">{state.pendingObligations.length}</span>}
               </button>
             ))}
           </div>
+
           <div className="panel-body">
-            {tab === 'licenses' && (
-              <>
-                {hiddenLicenseCount > 0 && (
-                  <p className="hint" style={{ margin: '0 4px 8px' }}>
-                    {hiddenLicenseCount} undiscovered license{hiddenLicenseCount === 1 ? '' : 's'} hidden — discover the resource first (Research tab).
-                  </p>
-                )}
-                <table>
-                <thead><tr><th>Resource</th><th>Class</th><th className="num">Cost</th><th>Status</th><th>Current owner(s)</th><th></th></tr></thead>
-                <tbody>
-                  {visibleLicenses.map((def) => {
-                    const held = state.player.licenses.find((l) => l.resourceId === def.resourceId);
-                    const recipe = state.recipes.find((rc) => rc.output === def.resourceId);
-                    const recipeKnown = recipe !== undefined && state.player.knowledge.knownRecipeIds.has(recipe.id);
-                    const owners: string[] = [];
-                    if (held) owners.push(held.status === 'active' ? 'You' : `You (${held.status})`);
-                    for (const rival of state.rivals) {
-                      const rivalLic = rival.licenses.find((l) => l.resourceId === def.resourceId && l.status === 'active');
-                      if (rivalLic) owners.push(rival.name);
-                    }
-                    return (
-                      <tr key={def.resourceId}>
-                        <td className="resource-name">{resourceName(def.resourceId)}</td>
-                        <td className="muted">{def.class}</td>
-                        <td className="num">{def.upfrontCost}g + {def.renewalCost}g/{def.renewalPeriod} turns</td>
-                        <td>
-                          {held ? (
-                            <span className="lic-yes">{held.status}</span>
-                          ) : (
-                            <span className="muted">not held{recipeKnown ? ' — recipe known, license not bought' : ''}</span>
-                          )}
-                        </td>
-                        <td className="muted">{owners.length > 0 ? owners.join(', ') : 'unclaimed'}</td>
-                        <td>
-                          {!held && (
-                            <button
-                              disabled={state.player.reputation < def.minReputation || state.player.cash < def.upfrontCost}
-                              onClick={() => cmd({ kind: 'buyLicense', resourceId: def.resourceId })}>
-                              Buy
-                            </button>
-                          )}
-                          {held && <button onClick={() => cmd({ kind: 'dropLicense', resourceId: def.resourceId })}>Drop</button>}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-                </table>
-              </>
-            )}
-
-            {tab === 'research' && (
-              <>
-                <p className="muted" style={{ margin: '6px 4px' }}>
-                  Active commission:{' '}
-                  {activeCommission
-                    ? `${activeCommission.blind ? 'Breakthrough research' : `Experimenting with ${(activeCommission.ingredients ?? []).map(resourceName).join(', ')}`} — ${activeCommission.turnsLeft} turns left`
-                    : 'none'}
-                </p>
-
-                <h3 className="sub">Breakthrough (3 ticks · {scenario.researchCost}g)</h3>
-                <p className="hint" style={{ margin: '0 4px 8px' }}>
-                  A breakthrough finds a random recipe you can now reach — one whose ingredients you already know how to make.
-                  {discoverableCount > 0 ? ` ${discoverableCount} within reach.` : ' Nothing new within reach — discover more ingredients first.'}
-                </p>
-                <button className="discover-btn" disabled={!!activeCommission || discoverableCount === 0 || state.player.cash < scenario.researchCost} onClick={() => cmd({ kind: 'researchBlind' })}>
-                  🔬 Breakthrough · {scenario.researchCost}g
-                </button>
-
-                <h3 className="sub">Or experiment with ingredients (3 ticks · {ingredientResearchCost(targetTier)}g)</h3>
-                <p className="hint" style={{ margin: '0 4px 8px' }}>
-                  Pick ingredients you know how to make and a tier to aim for; research finds a recipe of that tier built from them.
-                  Costs more for higher tiers — you're paying for precision, not luck.
-                </p>
-                {knownResources.length === 0 ? (
-                  <p className="muted" style={{ padding: '0 4px' }}>Discover an ingredient first (try a breakthrough).</p>
-                ) : (
-                  <>
-                    <div className="btn-row">
-                      {knownResources.map((r) => (
-                        <button key={r.id} className={researchPick.includes(r.id) ? 'pick-chip selected' : 'pick-chip'}
-                          disabled={!!activeCommission} onClick={() => toggleResearchPick(r.id)}>
-                          {researchPick.includes(r.id) ? '✓ ' : ''}{r.name}
-                        </button>
-                      ))}
-                    </div>
-                    <div className="btn-row" style={{ marginTop: '6px' }}>
-                      {availableTiers.map((t) => (
-                        <button key={t} className={targetTier === t ? 'pick-chip selected' : 'pick-chip'}
-                          disabled={!!activeCommission} onClick={() => setTargetTier(t)}>
-                          {targetTier === t ? '✓ ' : ''}Tier {t} · {ingredientResearchCost(t)}g
-                        </button>
-                      ))}
-                    </div>
-                    <button className="discover-btn" disabled={!!activeCommission || researchPick.length === 0 || state.player.cash < ingredientResearchCost(targetTier)}
-                      onClick={() => { cmd({ kind: 'researchByIngredients', ingredients: [...researchPick], targetTier }); setResearchPick([]); }}>
-                      ⚗ Experiment with selection · {ingredientResearchCost(targetTier)}g
-                    </button>
-                    {researchPick.length > 0 && (
-                      <p className="hint" style={{ margin: '6px 4px 0' }}>
-                        {pickMatches > 0
-                          ? `${pickMatches} undiscovered tier-${targetTier} recipe${pickMatches > 1 ? 's' : ''} can be built from this selection.`
-                          : `No undiscovered tier-${targetTier} recipe uses only these ingredients — add or change your picks, or try a different tier.`}
-                      </p>
-                    )}
-                  </>
-                )}
-
-                <h3 className="sub">Known recipes</h3>
-                {state.player.knowledge.knownRecipeIds.size === 0 ? (
-                  <div className="muted" style={{ padding: '0 4px' }}>None yet — research to discover recipes.</div>
-                ) : (
-                  <div className="btn-row" style={{ padding: '0 4px' }}>
-                    {[...state.player.knowledge.knownRecipeIds].map((id) => {
-                      const recipe = state.recipes.find((rc) => rc.id === id);
-                      const exclusive = recipe && recipe.exclusiveTurnsLeft !== undefined && recipe.exclusiveTurnsLeft > 0;
-                      return (
-                        <span key={id} className="known-recipe-chip">
-                          {resourceName(recipe?.output ?? id)}
-                          {exclusive && <span className="exclusive-badge">🔒 exclusive · {recipe!.exclusiveTurnsLeft} turns</span>}
-                          {!exclusive && recipe?.published && <span className="muted"> (public)</span>}
-                        </span>
-                      );
-                    })}
-                  </div>
-                )}
-              </>
-            )}
-
-            {tab === 'facilities' && (
-              <>
-                <table>
-                  <thead><tr><th>Type</th><th>Producing</th><th>Output</th><th className="num">Level</th><th>Status</th><th className="num">Capacity</th><th>Workers</th><th></th></tr></thead>
-                  <tbody>
-                    {state.player.facilities.map((f) => {
-                      const def = scenario.facilityTypes.find((ft) => ft.type === f.type)!;
-                      const options = scenario.resources.filter((r) => r.facility === f.type && isDiscovered(r.id));
-                      const upCost = levelUpCost(def, f.level);
-                      const upDuration = levelUpDuration(def);
-                      const atMax = f.level >= MAX_FACILITY_LEVEL;
-                      const leveling = f.levelUpTurnsLeft !== undefined;
-                      const building = f.buildTurnsLeft > 0;
-                      const licensed = state.player.licenses.some((l) => l.resourceId === f.assignedResourceId && l.status === 'active');
-                      const recipe = state.recipes.find((rec) => rec.output === f.assignedResourceId);
-                      const known = recipe !== undefined && state.player.knowledge.knownRecipeIds.has(recipe.id);
-                      const producing = state.player.autoProduce.includes(f.assignedResourceId);
-                      return (
-                        <tr key={f.id}>
-                          <td className="resource-name">{f.type}</td>
-                          <td>
-                            <select value={f.assignedResourceId} disabled={building}
-                              onChange={(e) => cmd({ kind: 'reassignFacility', facilityId: f.id, resourceId: e.target.value })}>
-                              {options.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
-                            </select>
-                          </td>
-                          <td>
-                            {building ? (
-                              <span className="muted">—</span>
-                            ) : !licensed ? (
-                              <span className="muted">no license</span>
-                            ) : !known ? (
-                              <span className="muted">undiscovered</span>
-                            ) : (
-                              <button
-                                className={producing ? 'toggle-on' : 'toggle-off'}
-                                onClick={() => cmd({ kind: 'toggleAutoProduce', resourceId: f.assignedResourceId, on: !producing })}>
-                                {producing ? '● On' : 'Enable'}
-                              </button>
-                            )}
-                          </td>
-                          <td className="num">L{f.level}</td>
-                          <td className="muted">
-                            {building ? `building · ${f.buildTurnsLeft} turns` : leveling ? `leveling · ${f.levelUpTurnsLeft} turns` : 'operational'}
-                          </td>
-                          <td className="num">{Math.round(effectiveCapacity(f))}/turn</td>
-                          <td>
-                            {f.hiredWorkers}/{f.requiredWorkers}{' '}
-                            <button onClick={() => cmd({ kind: 'hireFire', facilityId: f.id, targetWorkers: f.hiredWorkers + 1 })}>+1</button>{' '}
-                            <button onClick={() => cmd({ kind: 'hireFire', facilityId: f.id, targetWorkers: Math.max(0, f.hiredWorkers - 1) })}>−1</button>
-                          </td>
-                          <td>
-                            <button
-                              disabled={building || leveling || atMax || state.player.cash < upCost}
-                              onClick={() => cmd({ kind: 'levelUpFacility', facilityId: f.id })}>
-                              {atMax ? 'Max level' : `Level up · ${upCost}g · ${upDuration} turns`}
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-                <p className="hint">Level up raises capacity and slows condition decay; the facility keeps running at its current level while upgrading.</p>
-
-                <h3 className="sub">Build new</h3>
-                <div className="supply-form">
-                  <div className="form-row">
-                    <div className="field">
-                      <label>Facility type</label>
-                      <select value={buildForm.facilityType}
-                        onChange={(e) => {
-                          const facilityType = e.target.value;
-                          const resourceId = scenario.resources.find((r) => r.facility === facilityType && isDiscovered(r.id))!.id;
-                          setBuildForm({ facilityType, resourceId });
-                        }}>
-                        {scenario.facilityTypes
-                          .filter((f) => scenario.resources.some((r) => r.facility === f.type && isDiscovered(r.id)))
-                          .map((f) => <option key={f.type} value={f.type}>{f.type}</option>)}
-                      </select>
-                    </div>
-                    <div className="field field-wide">
-                      <label>Produces</label>
-                      <select value={buildForm.resourceId}
-                        onChange={(e) => setBuildForm((f) => ({ ...f, resourceId: e.target.value }))}>
-                        {scenario.resources.filter((r) => r.facility === buildForm.facilityType && isDiscovered(r.id)).map((r) => (
-                          <option key={r.id} value={r.id}>{r.name}</option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                  {(() => {
-                    const def = scenario.facilityTypes.find((f) => f.type === buildForm.facilityType)!;
-                    return (
-                      <button className="discover-btn propose-btn"
-                        disabled={state.player.cash < def.buildCost}
-                        onClick={() => cmd({ kind: 'buildFacility', facilityType: buildForm.facilityType, resourceId: buildForm.resourceId })}>
-                        Build · {def.buildCost}g · {def.buildTurns} turns
-                      </button>
-                    );
-                  })()}
-                </div>
-              </>
-            )}
-
-            {tab === 'contracts' && (
-              <>
-                <h3 className="sub">Contract board — one-off quests</h3>
-                <table>
-                  <thead><tr><th>Issuer</th><th>Resource</th><th className="num">Qty</th><th className="num">Deadline</th><th className="num">Payout</th><th className="num">Rep</th><th className="num">Expires</th><th></th></tr></thead>
-                  <tbody>
-                    {state.contractBoard.map((offer) => (
-                      <tr key={offer.id}>
-                        <td className="muted">{offer.issuer}</td>
-                        <td className="resource-name">{resourceName(offer.resourceId)}</td>
-                        <td className="num">{offer.qty}</td>
-                        <td className="num">{offer.deadlineTurnsLeft} turns</td>
-                        <td className="num">{offer.payout}g{offer.lawsuitOnBreach ? ' *' : ''}</td>
-                        <td className="num">+{offer.reputationReward}</td>
-                        <td className="num">{offer.boardTurnsLeft} turns</td>
-                        <td><button onClick={() => cmd({ kind: 'acceptQuestContract', id: offer.id })}>Accept</button></td>
-                      </tr>
-                    ))}
-                    {state.contractBoard.length === 0 && <tr><td colSpan={8} className="muted">No offers right now — check back soon.</td></tr>}
-                  </tbody>
-                </table>
-                <p className="hint">* large contracts trigger a breach lawsuit if missed</p>
-
-                <h3 className="sub">Long quests — deliver the same amount every turn</h3>
-                <table>
-                  <thead><tr><th>Issuer</th><th>Resource</th><th className="num">Qty/turn</th><th className="num">Price</th><th className="num">Duration</th><th className="num">Expires</th><th></th></tr></thead>
-                  <tbody>
-                    {state.standingOfferBoard.map((offer) => (
-                      <tr key={offer.id}>
-                        <td className="muted">{offer.issuer}</td>
-                        <td className="resource-name">{resourceName(offer.resourceId)}</td>
-                        <td className="num">{offer.qtyPerTurn}</td>
-                        <td className="num">{offer.price}g</td>
-                        <td className="num">{offer.turnsLeft} turns</td>
-                        <td className="num">{offer.boardTurnsLeft} turns</td>
-                        <td><button onClick={() => cmd({ kind: 'acceptStandingOffer', id: offer.id })}>Accept</button></td>
-                      </tr>
-                    ))}
-                    {state.standingOfferBoard.length === 0 && <tr><td colSpan={7} className="muted">No standing offers right now — check back soon.</td></tr>}
-                  </tbody>
-                </table>
-                <p className="hint">A locked price for the full duration — deliver every turn or it breaches like any standing contract.</p>
-
-                <h3 className="sub">My quest contracts</h3>
-                <table>
-                  <thead><tr><th>Resource</th><th>Progress</th><th className="num">Deadline</th><th className="num">Payout</th><th></th></tr></thead>
-                  <tbody>
-                    {state.player.questContracts.map((c) => {
-                      const have = state.player.inventory[c.resourceId]?.qty ?? 0;
-                      const needed = c.qty - c.deliveredQty;
-                      const canDeliver = have >= needed;
-                      const cancelFee = Math.round(c.penalty * 0.5);
-                      return (
-                        <tr key={c.id}>
-                          <td className="resource-name">{resourceName(c.resourceId)}</td>
-                          <td className="muted">{have} / {needed} needed</td>
-                          <td className="num">{c.deadlineTurnsLeft} turns</td>
-                          <td className="num">{c.payout}g</td>
-                          <td>
-                            <button disabled={!canDeliver} onClick={() => cmd({ kind: 'deliverQuestContract', id: c.id })}>Deliver</button>{' '}
-                            <button onClick={() => cmd({ kind: 'cancelQuestContract', id: c.id })}>Cancel · {cancelFee}g</button>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                    {state.player.questContracts.length === 0 && <tr><td colSpan={5} className="muted">None accepted.</td></tr>}
-                  </tbody>
-                </table>
-
-                <h3 className="sub">Standing supply contracts</h3>
-                <table>
-                  <thead><tr><th>Side</th><th>Resource</th><th className="num">Qty/turn</th><th className="num">Price</th><th className="num">Turns</th><th className="num">Missed</th><th></th><th></th></tr></thead>
-                  <tbody>
-                    {state.player.supplyContracts.map((c) => {
-                      const have = state.player.inventory[c.resourceId]?.qty ?? 0;
-                      const canSend = c.side === 'sell' ? have >= c.qtyPerTurn : state.player.cash >= c.qtyPerTurn * c.price;
-                      return (
-                        <tr key={c.id}>
-                          <td className="muted">{c.side}</td>
-                          <td className="resource-name">{resourceName(c.resourceId)}</td>
-                          <td className="num">{c.qtyPerTurn}</td>
-                          <td className="num">{c.price}g</td>
-                          <td className="num">{c.turnsLeft} turns</td>
-                          <td className="num">{c.missedStreak}</td>
-                          <td>
-                            {c.settledThisTurn ? (
-                              <span className="muted">{c.side === 'sell' ? 'Sent' : 'Bought'}</span>
-                            ) : (
-                              <button disabled={!canSend} onClick={() => cmd({ kind: 'sendSupplyContractNow', id: c.id })}>
-                                {c.side === 'sell' ? 'Send now' : 'Buy now'}
-                              </button>
-                            )}
-                          </td>
-                          <td><button onClick={() => cmd({ kind: 'cancelSupplyContract', id: c.id })}>Cancel · {c.cancelFine}g</button></td>
-                        </tr>
-                      );
-                    })}
-                    {state.player.supplyContracts.length === 0 && <tr><td colSpan={8} className="muted">None active.</td></tr>}
-                  </tbody>
-                </table>
-                <p className="hint">
-                  "Send now"/"Buy now" settles this turn's delivery/purchase early — the automatic end-of-turn settlement is skipped once it's done.
-                </p>
-                <div className="supply-form">
-                  <div className="form-row">
-                    <div className="field">
-                      <label>Side</label>
-                      <select value={supplyForm.side} onChange={(e) => setSupplyForm((f) => ({ ...f, side: e.target.value as 'sell' | 'buy' }))}>
-                        <option value="sell">Sell</option>
-                        <option value="buy">Buy</option>
-                      </select>
-                    </div>
-                    <div className="field field-wide">
-                      <label>Resource</label>
-                      <select value={supplyForm.resourceId} onChange={(e) => setSupplyForm((f) => ({ ...f, resourceId: e.target.value }))}>
-                        {scenario.resources.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
-                      </select>
-                    </div>
-                  </div>
-                  <div className="form-row">
-                    <div className="field">
-                      <label>Qty/turn</label>
-                      <input type="number" min={1} value={supplyForm.qtyPerTurn}
-                        onChange={(e) => setSupplyForm((f) => ({ ...f, qtyPerTurn: Number(e.target.value) }))} />
-                    </div>
-                    <div className="field">
-                      <label>Price</label>
-                      <input type="number" min={0} value={supplyForm.price}
-                        onChange={(e) => setSupplyForm((f) => ({ ...f, price: Number(e.target.value) }))} />
-                    </div>
-                    <div className="field">
-                      <label>Duration</label>
-                      <input type="number" min={1} value={supplyForm.turnsLeft}
-                        onChange={(e) => setSupplyForm((f) => ({ ...f, turnsLeft: Number(e.target.value) }))} />
-                    </div>
-                  </div>
-                  <p className="hint" style={{ margin: '2px 2px 0' }}>
-                    {supplyForm.side === 'sell' ? 'Sell' : 'Buy'} {supplyForm.qtyPerTurn} {resourceName(supplyForm.resourceId)}/turn
-                    {' '}@ {supplyForm.price}g for {supplyForm.turnsLeft} turns
-                    {' '}(total {supplyForm.qtyPerTurn * supplyForm.price * supplyForm.turnsLeft}g)
-                  </p>
-                  <button className="discover-btn propose-btn" onClick={() => cmd({ kind: 'proposeSupplyContract', ...supplyForm })}>Propose</button>
-                </div>
-              </>
-            )}
-
-            {tab === 'bank' && (
-              <>
-                <div className="bank-summary">
-                  <div>
-                    <span className="label">Outstanding debt</span>
-                    <span className="value">{Math.round(outstandingDebt(state.player))}g</span>
-                  </div>
-                  <div>
-                    <span className="label">Credit limit</span>
-                    <span className="value">{creditLimit}g</span>
-                  </div>
-                </div>
-
-                <h3 className="sub">My loans</h3>
-                <table>
-                  <thead><tr><th className="num">Principal</th><th className="num">Remaining</th><th className="num">Payment/turn</th><th className="num">Term left</th><th className="num">Missed</th><th></th></tr></thead>
-                  <tbody>
-                    {state.player.loans.map((l) => (
-                      <tr key={l.id}>
-                        <td className="num">{l.principal}g</td>
-                        <td className="num">{Math.round(l.remaining)}g</td>
-                        <td className="num">{l.paymentPerTurn}g</td>
-                        <td className="num">{l.termTurnsLeft} turns</td>
-                        <td className="num">{l.missedPayments}</td>
-                        <td>
-                          <button disabled={state.player.cash < l.remaining}
-                            onClick={() => cmd({ kind: 'repayLoanEarly', loanId: l.id })}>
-                            Repay now
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                    {state.player.loans.length === 0 && <tr><td colSpan={6} className="muted">No active loans.</td></tr>}
-                  </tbody>
-                </table>
-
-                <h3 className="sub">Borrow</h3>
-                <div className="supply-form">
-                  <div className="form-row">
-                    <div className="field field-wide">
-                      <label>Amount</label>
-                      <input type="number" min={1} max={creditLimit} value={borrowAmount}
-                        onChange={(e) => setBorrowAmount(Number(e.target.value))} />
-                    </div>
-                  </div>
-                  <p className="hint" style={{ margin: '2px 2px 0' }}>
-                    Borrow {borrowAmount}g now, repay {Math.round(borrowAmount * 1.2)}g total (20% interest) over {LOAN_TERM_TURNS} turns
-                    {' '}(~{Math.round((borrowAmount * 1.2) / LOAN_TERM_TURNS)}g/turn). Unsecured — missed payments cost reputation, not assets.
-                  </p>
-                  <button className="discover-btn propose-btn"
-                    disabled={borrowAmount <= 0 || borrowAmount > creditLimit}
-                    onClick={() => cmd({ kind: 'takeLoan', amount: borrowAmount })}>
-                    Borrow
-                  </button>
-                </div>
-
-                <h3 className="sub">Gold</h3>
-                <p className="hint" style={{ margin: '0 4px 8px' }}>
-                  A speculative asset, not tied to any recipe or license — grows steadily on its own, but the occasional
-                  rally or crash can move its price far more sharply than that.
-                </p>
-                <div className="bank-summary">
-                  <div>
-                    <span className="label">Price</span>
-                    <span className="value">{state.goldPrice.toFixed(1)}g{priceDelta('__gold__', state.goldPrice)}</span>
-                  </div>
-                  <div>
-                    <span className="label">Held</span>
-                    <span className="value">{state.player.goldHeld}</span>
-                  </div>
-                  <div>
-                    <span className="label">Value</span>
-                    <span className="value">{Math.round(state.player.goldHeld * state.goldPrice)}g</span>
-                  </div>
-                </div>
-                <PriceChart history={state.goldPriceHistory} currentTurn={state.turn} />
-                <div className="supply-form">
-                  <div className="form-row">
-                    <div className="field field-wide">
-                      <label>Quantity</label>
-                      <input type="number" min={1} value={goldQty} onChange={(e) => setGoldQty(Number(e.target.value))} />
-                    </div>
-                  </div>
-                  <div className="btn-row">
-                    <button className="discover-btn propose-btn"
-                      disabled={goldQty <= 0 || state.player.cash < goldQty * state.goldPrice}
-                      onClick={() => cmd({ kind: 'buyGold', qty: goldQty })}>
-                      Buy · {Math.round(goldQty * state.goldPrice)}g
-                    </button>
-                    <button
-                      disabled={goldQty <= 0 || state.player.goldHeld < goldQty}
-                      onClick={() => cmd({ kind: 'sellGold', qty: goldQty })}>
-                      Sell · {Math.round(goldQty * state.goldPrice)}g
-                    </button>
-                  </div>
-                </div>
-              </>
-            )}
-
-            {tab === 'payments' && (
-              <>
-                <div className="bank-summary">
-                  <div>
-                    <span className="label">Due next turn</span>
-                    <span className="value">{Math.round(bills.totalPerTurn)}g</span>
-                  </div>
-                </div>
-
-                <h3 className="sub">Facility upkeep &amp; payroll</h3>
-                <table>
-                  <thead><tr><th>Facility</th><th className="num">Upkeep</th><th className="num">Payroll</th><th className="num">Total</th><th></th></tr></thead>
-                  <tbody>
-                    {bills.facilities.map((f) => (
-                      <tr key={f.facilityId}>
-                        <td className="resource-name">{f.type}</td>
-                        <td className="num">{Math.round(f.upkeep)}g</td>
-                        <td className="num">{Math.round(f.payroll)}g</td>
-                        <td className="num">{Math.round(f.upkeep + f.payroll)}g</td>
-                        <td>
-                          {f.prepaid ? (
-                            <span className="muted">Paid</span>
-                          ) : (
-                            <button disabled={state.player.cash < f.upkeep + f.payroll}
-                              onClick={() => cmd({ kind: 'payFacilityUpkeepNow', facilityId: f.facilityId })}>
-                              Pay now
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                    {bills.facilities.length === 0 && <tr><td colSpan={5} className="muted">No operational facilities.</td></tr>}
-                  </tbody>
-                </table>
-
-                <h3 className="sub">Defenses</h3>
-                <table>
-                  <thead><tr><th>Item</th><th className="num">Per turn</th></tr></thead>
-                  <tbody>
-                    <tr><td className="resource-name">Insurance</td><td className="num">{bills.insurance > 0 ? `${Math.round(bills.insurance)}g` : <span className="muted">off</span>}</td></tr>
-                    <tr><td className="resource-name">Legal team</td><td className="num">{bills.legalRetainer > 0 ? `${bills.legalRetainer}g` : <span className="muted">off</span>}</td></tr>
-                  </tbody>
-                </table>
-
-                <h3 className="sub">Loan payments</h3>
-                <table>
-                  <thead><tr><th className="num">Payment</th><th className="num">Remaining</th><th></th></tr></thead>
-                  <tbody>
-                    {state.player.loans.map((l) => {
-                      const payment = Math.min(l.paymentPerTurn, l.remaining);
-                      return (
-                        <tr key={l.id}>
-                          <td className="num">{Math.round(payment)}g</td>
-                          <td className="num">{Math.round(l.remaining)}g</td>
-                          <td>
-                            {l.settledThisTurn ? (
-                              <span className="muted">Paid</span>
-                            ) : (
-                              <button disabled={state.player.cash < payment}
-                                onClick={() => cmd({ kind: 'payLoanNow', loanId: l.id })}>
-                                Pay now
-                              </button>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                    {state.player.loans.length === 0 && <tr><td colSpan={3} className="muted">No active loans.</td></tr>}
-                  </tbody>
-                </table>
-
-                <h3 className="sub">Buy-side supply contracts</h3>
-                <table>
-                  <thead><tr><th>Resource</th><th className="num">Cost/turn</th></tr></thead>
-                  <tbody>
-                    {bills.buyContracts.map((c) => (
-                      <tr key={c.contractId}>
-                        <td className="resource-name">{resourceName(c.resourceId)}</td>
-                        <td className="num">{Math.round(c.cost)}g</td>
-                      </tr>
-                    ))}
-                    {bills.buyContracts.length === 0 && <tr><td colSpan={2} className="muted">None active.</td></tr>}
-                  </tbody>
-                </table>
-
-                <h3 className="sub">Upcoming license renewals</h3>
-                <table>
-                  <thead><tr><th>Resource</th><th className="num">Cost</th><th className="num">Due in</th><th></th></tr></thead>
-                  <tbody>
-                    {bills.licenseRenewals.map((l) => {
-                      const atRisk = state.player.cash < l.cost;
-                      return (
-                        <tr key={l.resourceId}>
-                          <td className="resource-name">{resourceName(l.resourceId)}</td>
-                          <td className="num">{l.cost}g</td>
-                          <td className="num">
-                            {l.turnsUntilRenewal} turns
-                            {atRisk && (
-                              <span className="warn-chip" title="You can't currently afford this renewal — it will suspend the license instead of charging you">
-                                ⚠ can't afford
-                              </span>
-                            )}
-                          </td>
-                          <td>
-                            <button disabled={state.player.cash < l.cost}
-                              onClick={() => cmd({ kind: 'renewLicenseNow', resourceId: l.resourceId })}>
-                              Renew now
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                    {bills.licenseRenewals.length === 0 && <tr><td colSpan={4} className="muted">No licenses held.</td></tr>}
-                  </tbody>
-                </table>
-                <p className="hint">
-                  If you can't afford a renewal when it comes due, the license suspends for a few turns instead of taking your cash negative.
-                </p>
-                <p className="hint">
-                  Renewals are periodic (not charged every turn) — renewing early just resets the countdown, it doesn't discount the fee.
-                  Facility upkeep/payroll can be paid a turn ahead — it just settles this turn's charge early, so the automatic
-                  deduction is skipped once. Defenses and buy contracts still don't have a "pay now" — they're recalculated fresh
-                  each turn with no balance to pay ahead of.
-                </p>
-              </>
-            )}
-
-            {tab === 'defenses' && (
-              <>
-                <label className="defense-option">
-                  <input type="checkbox" checked={state.player.defenses.insurance} onChange={(e) => cmd({ kind: 'toggleInsurance', on: e.target.checked })} />
-                  <span>Insurance<span className="desc"> — 2% of assets per turn; disasters do half damage</span></span>
-                </label>
-                <label className="defense-option">
-                  <input type="checkbox" checked={state.player.defenses.legalTeam} onChange={(e) => cmd({ kind: 'toggleLegalTeam', on: e.target.checked })} />
-                  <span>Legal team<span className="desc"> — 25g retainer per turn; fewer suspensions, better court odds</span></span>
-                </label>
-                <p className="hint">Safety is a tax on greed — every defense costs real profit.</p>
-              </>
-            )}
-
-            {tab === 'leaderboard' && (
-              <>
-                <table>
-                  <thead><tr><th className="num">Rank</th><th>Company</th><th className="num">Standing</th><th className="num">Reputation</th><th className="num">Licenses</th><th>Personality</th></tr></thead>
-                  <tbody>
-                    {leaderboard.map((entry, i) => (
-                      <tr key={entry.name} className={entry.isPlayer ? 'leaderboard-you' : undefined}>
-                        <td className="num">{i + 1}</td>
-                        <td className="resource-name">{entry.name}</td>
-                        <td className="num">{entry.standing}g</td>
-                        <td className="num">{Math.round(entry.reputation)}</td>
-                        <td className="num">{entry.licenses}</td>
-                        <td className="muted">{entry.personality ?? '—'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                <p className="hint">
-                  Rivals in this simulation only track cash — no facilities or inventory — so "Standing" is your full net worth
-                  (cash + facilities + inventory − debt) versus their cash alone. Not perfectly apples-to-apples, but the best
-                  available comparison.
-                </p>
-              </>
-            )}
-
-            {tab === 'log' && (
-              <>
-                <div className="supply-form">
-                  <div className="form-row">
-                    <div className="field field-wide">
-                      <label>Filter</label>
-                      <input type="text" placeholder="e.g. Quota, license id, Gold…" value={logFilter}
-                        onChange={(e) => setLogFilter(e.target.value)} />
-                    </div>
-                  </div>
-                </div>
-                <table className="log-table">
-                  <thead><tr><th className="num">Turn</th><th>Event</th><th className="num">Δ Cash</th><th className="num">Cash after</th></tr></thead>
-                  <tbody>
-                    {state.ledger
-                      .filter((e) => e.label.toLowerCase().includes(logFilter.toLowerCase()))
-                      .slice()
-                      .reverse()
-                      .map((e, i) => (
-                        <tr key={state.ledger.length - i}>
-                          <td className="num">{e.turn}</td>
-                          <td>{e.label}</td>
-                          <td className={`num ${e.delta > 0 ? 'log-delta-up' : e.delta < 0 ? 'log-delta-down' : 'muted'}`}>
-                            {e.delta === 0 ? '—' : `${e.delta > 0 ? '+' : ''}${Math.round(e.delta)}g`}
-                          </td>
-                          <td className="num">{Math.round(e.cashAfter)}g</td>
-                        </tr>
-                      ))}
-                  </tbody>
-                </table>
-                <p className="hint">Full unfiltered event log — every ledger entry ever recorded, newest first.</p>
-              </>
-            )}
+            {tab === 'production' && <ProductionTab state={state} scenario={scenario} cmd={cmd} onBoost={handleBoost} />}
+            {tab === 'market' && <MarketTab state={state} scenario={scenario} cmd={cmd} />}
+            {tab === 'bank' && <BankTab state={state} cmd={cmd} incomePerCycle={incomePerCycle} />}
+            {tab === 'managers' && <ManagersTab state={state} cmd={cmd} />}
+            {tab === 'gold' && <GoldTab state={state} cmd={cmd} goldQty={goldQty} setGoldQty={setGoldQty} />}
+            {tab === 'log' && <LogTab state={state} />}
           </div>
         </section>
       </div>
 
-      <footer className="actionbar">
-        <div className="chips">
-          {flash.length === 0
-            ? <span className="placeholder">Take your actions, then end the turn.</span>
-            : flash.map((s, i) => <span key={i} className="chip">{s}</span>)}
-        </div>
-        <button className="end-turn" onClick={endTurn}>End Turn ➤</button>
+      <footer className="ticker">
+        {state.ledger.slice(-3).reverse().map((e, i) => (
+          <span key={state.ledger.length - i} className="tick-item">
+            {e.label}
+            {e.deltaG !== 0 && <em className={e.deltaG > 0 ? 'up' : 'down'}> {e.deltaG > 0 ? '+' : ''}{fmt(e.deltaG)}g</em>}
+          </span>
+        ))}
       </footer>
 
-      {recipeTree && <RecipeTreeView tree={recipeTree} onClose={() => setTreeResource(null)} />}
-      {marketIntel && <MarketIntelView intel={marketIntel} onClose={() => setIntelResource(null)} />}
+      {pops.map((p) => (
+        <span key={p.id} className="click-pop" style={{ left: p.x, top: p.y }}>{p.text}</span>
+      ))}
+
+      {state.outcome && (
+        <EndReport state={state} scenario={scenario} onExit={onExit} onReplay={() => setState(newGame(scenario, { seed: SEED + state.cycle, sandbox }))} />
+      )}
     </div>
   );
 }
 
-export default App;
+function estimateIncomePerCycle(state: GameState, scenario: ScenarioConfig): number {
+  const contractIncome = state.contracts.reduce((s, c) => s + c.qtyPerCycle * c.pricePerUnit, 0);
+  return contractIncome - managerSalaryTotal(state) - upkeepTotal(state, scenario);
+}
+
+// Emoji per facility type — a cheap way to give each grid tile a distinct
+// silhouette you can recognise at a glance, RTS-style.
+const FACILITY_ICON: Record<string, string> = {
+  farm: '🌾', hop_yard: '🌿', glassworks: '🫙', malthouse: '🏚️', brewery: '🍺', packaging_plant: '📦',
+  wheat_farm: '🌾', henhouse: '🥚', sugar_mill: '🍬', mill: '🌀', kitchen: '🎂', cake_shop: '🍰',
+};
+
+function ProductionTab({
+  state,
+  scenario,
+  cmd,
+  onBoost,
+}: {
+  state: GameState;
+  scenario: ScenarioConfig;
+  cmd: (c: Command) => void;
+  onBoost: (facilityId: string, e: React.MouseEvent) => void;
+}) {
+  const tier = unlockedTier(state, scenario);
+  const buildable = scenario.facilityTypes.filter((def) => productById(scenario, def.productId).tier <= tier);
+  const locked = scenario.facilityTypes.filter((def) => productById(scenario, def.productId).tier > tier);
+
+  return (
+    <>
+      <div className="grid-head">
+        <h3 className="sub">Your base</h3>
+        <span className="grid-hint">Tap a building to work it by hand</span>
+      </div>
+
+      <div className="rts-grid">
+        {state.facilities.map((f) => {
+          const def = facilityTypeDef(scenario, f.type);
+          const product = productById(scenario, f.productId);
+          const up = levelUpCost(f, scenario);
+          const perCycle = facilityRatePerSec(f, scenario) * SETTLE_INTERVAL_SEC;
+          const margin = unitMargin(state, scenario, f.productId);
+          const price = state.market[f.productId].price;
+          const marginPct = price > 0 ? (margin / price) * 100 : 0;
+          const held = state.inventory[f.productId] ?? 0;
+          // f.accumulator is the fractional unit in progress — a natural progress bar.
+          const progress = Math.min(1, f.accumulator % 1);
+          const starved = product.inputs.some((i) => (state.inventory[i.id] ?? 0) < i.qty);
+
+          return (
+            <div
+              key={f.id}
+              className={`rts-tile ${starved ? 'starved' : ''}`}
+              onClick={(e) => onBoost(f.id, e)}
+              title={`Tap to make ~${Math.max(1, Math.round(facilityRatePerSec(f, scenario)))} ${product.name}`}
+            >
+              <div className="tile-top">
+                <span className="tile-icon">{FACILITY_ICON[f.type] ?? '🏭'}</span>
+                <span className="tile-lvl">L{f.level}</span>
+              </div>
+              <div className="tile-name">{def.name}</div>
+              <div className="tile-product">
+                {product.name} <b>{fmt(held)}</b>
+              </div>
+              <div className="tile-bar"><div className="tile-fill" style={{ width: `${progress * 100}%` }} /></div>
+              <div className="tile-stats">
+                <span>{perCycle.toFixed(0)}/cyc</span>
+                <span className={margin > 0 ? 'up' : margin < 0 ? 'down' : 'muted'}>
+                  {margin >= 0 ? '+' : ''}{marginPct.toFixed(0)}%
+                </span>
+                <span className="tile-upkeep">−{fmt(facilityUpkeep(f, scenario))}g</span>
+              </div>
+              {starved && <div className="tile-starved">needs inputs</div>}
+              <div className="tile-actions" onClick={(e) => e.stopPropagation()}>
+                <button disabled={state.cash < up} onClick={() => cmd({ kind: 'levelUpFacility', facilityId: f.id })}>
+                  ⬆ {fmt(up)}g
+                </button>
+                <button onClick={() => cmd({ kind: 'sellFacility', facilityId: f.id })}>Sell</button>
+              </div>
+            </div>
+          );
+        })}
+
+        {buildable.map((def) => {
+          const blocked = state.taxDebt > 0;
+          const afford = state.cash >= def.buildCost;
+          return (
+            <button
+              key={`build-${def.type}`}
+              className="rts-tile build-slot"
+              disabled={blocked || !afford}
+              onClick={() => cmd({ kind: 'buildFacility', facilityType: def.type })}
+              title={blocked ? 'Clear tax debt first' : !afford ? 'Not enough cash' : `Build a ${def.name}`}
+            >
+              <span className="slot-plus">+</span>
+              <span className="slot-icon">{FACILITY_ICON[def.type] ?? '🏭'}</span>
+              <span className="slot-name">{def.name}</span>
+              <span className="slot-cost">{fmt(def.buildCost)}g</span>
+            </button>
+          );
+        })}
+
+        {locked.map((def) => {
+          const product = productById(scenario, def.productId);
+          return (
+            <div key={`locked-${def.type}`} className="rts-tile locked-slot" title={`Unlocks at tier ${product.tier}`}>
+              <span className="slot-lock">🔒</span>
+              <span className="slot-name">{def.name}</span>
+              <span className="slot-cost">tier {product.tier}</span>
+            </div>
+          );
+        })}
+      </div>
+
+      <p className="hint">
+        Unlocked to tier {tier}. Sell something to reach tier 1; take a building to L2 to unlock the tier above it.
+      </p>
+    </>
+  );
+}
+
+function MarketTab({ state, scenario, cmd }: { state: GameState; scenario: ScenarioConfig; cmd: (c: Command) => void }) {
+  const [contractForm, setContractForm] = useState({ productId: scenario.products[0].id, qty: 3, cycles: 12 });
+  return (
+    <>
+      <h3 className="sub">Spot market — buy inputs, sell surplus</h3>
+      <div className="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Product</th><th className="num">Price</th><th className="num">Held</th><th></th></tr>
+          </thead>
+          <tbody>
+            {scenario.products.map((p) => {
+              const held = state.inventory[p.id] ?? 0;
+              const price = state.market[p.id].price;
+              return (
+                <tr key={p.id}>
+                  <td>{p.name}<span className="tier-chip">T{p.tier}</span></td>
+                  <td className="num">{price.toFixed(1)}g</td>
+                  <td className="num">{fmt(held)}</td>
+                  <td className="row-actions">
+                    <button disabled={held < 1} onClick={() => cmd({ kind: 'spotSell', productId: p.id, qty: held })}>Sell all</button>
+                    <button disabled={state.cash < price} onClick={() => cmd({ kind: 'spotBuy', productId: p.id, qty: 10 })}>Buy 10</button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <h3 className="sub">Sign a standing contract</h3>
+      <p className="hint">Locks a price above spot — steady income you can size loans against. Deliver every cycle or the customer walks.</p>
+      <div className="contract-form">
+        <label>Product
+          <select value={contractForm.productId} onChange={(e) => setContractForm((f) => ({ ...f, productId: e.target.value }))}>
+            {scenario.products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </label>
+        <label>Qty/cycle
+          <input type="number" min={1} value={contractForm.qty} onChange={(e) => setContractForm((f) => ({ ...f, qty: Math.max(1, Number(e.target.value)) }))} />
+        </label>
+        <label>Cycles
+          <input type="number" min={1} value={contractForm.cycles} onChange={(e) => setContractForm((f) => ({ ...f, cycles: Math.max(1, Number(e.target.value)) }))} />
+        </label>
+        <button className="primary" onClick={() => cmd({ kind: 'signStandingContract', productId: contractForm.productId, qtyPerCycle: contractForm.qty, cycles: contractForm.cycles })}>Sign</button>
+      </div>
+
+      {state.contracts.length > 0 && (
+        <>
+          <h3 className="sub">Active contracts</h3>
+          <div className="table-scroll">
+            <table>
+              <thead><tr><th>Customer</th><th>Product</th><th className="num">Qty/cyc</th><th className="num">Price</th><th className="num">Left</th></tr></thead>
+              <tbody>
+                {state.contracts.map((c) => (
+                  <tr key={c.id}>
+                    <td>{c.customer}{c.fromEvent && <span className="tier-chip">event</span>}</td>
+                    <td>{productById(scenario, c.productId).name}</td>
+                    <td className="num">{c.qtyPerCycle}</td>
+                    <td className="num">{c.pricePerUnit}g</td>
+                    <td className="num">{c.cyclesLeft}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+function BankTab({ state, cmd, incomePerCycle }: { state: GameState; cmd: (c: Command) => void; incomePerCycle: number }) {
+  const installTotal = state.loans.reduce((s, l) => s + l.installmentPerCycle, 0);
+  return (
+    <>
+      <h3 className="sub">Loans</h3>
+      <p className="hint">
+        Borrowing lets you expand before you've saved up. But every loan adds a fixed payment each cycle — your income must cover it.
+        {' '}Current loan payments: <b>{fmt(installTotal)}g/cycle</b> vs income <b>{fmt(incomePerCycle)}g/cycle</b>.
+      </p>
+      {state.loanArrears > 0 && <p className="warn-line">In arrears — clear it in the “Due now” panel before borrowing again.</p>}
+      <div className="loan-offers">
+        {LOAN_OFFERS.map((o) => (
+          <div key={o.id} className="loan-card">
+            <div className="loan-head"><b>{o.label}</b><span>{fmt(o.principal)}g now</span></div>
+            <p className="loan-terms">{o.installmentPerCycle}g/cycle × {o.termCycles} cycles = {fmt(o.totalRepay)}g repaid ({Math.round((o.totalRepay / o.principal - 1) * 100)}% interest)</p>
+            <button className="primary" disabled={state.loanArrears > 0} onClick={() => cmd({ kind: 'takeLoan', offerId: o.id })}>Borrow</button>
+          </div>
+        ))}
+      </div>
+
+      {state.loans.length > 0 && (
+        <>
+          <h3 className="sub">Active loans</h3>
+          <div className="table-scroll">
+            <table>
+              <thead><tr><th>Loan</th><th className="num">Balance</th><th className="num">Payment</th><th className="num">Left</th></tr></thead>
+              <tbody>
+                {state.loans.map((l) => (
+                  <tr key={l.id}>
+                    <td>{l.label}</td>
+                    <td className="num">{fmt(l.balance)}g</td>
+                    <td className="num">{l.installmentPerCycle}g</td>
+                    <td className="num">{l.cyclesLeft}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+function ManagersTab({ state, cmd }: { state: GameState; cmd: (c: Command) => void }) {
+  const rows = [
+    { role: 'shipping' as const, name: 'Shipping Manager', salary: SHIPPING_SALARY, count: state.managers.shipping, desc: `Auto-delivers contracts (each covers ${CONTRACTS_PER_MANAGER}).` },
+    { role: 'finance' as const, name: 'Finance Manager', salary: FINANCE_SALARY, count: state.managers.finance ? 1 : 0, desc: 'Auto-pays loan installments.' },
+    { role: 'accountant' as const, name: 'Accountant', salary: ACCOUNTANT_SALARY, count: state.managers.accountant ? 1 : 0, desc: 'Auto-pays the tax bill.' },
+  ];
+  return (
+    <>
+      <h3 className="sub">Managers</h3>
+      <p className="hint">Managers do the clicking for you — for a salary every cycle. Worth it once you're big; a drag when you're small. Total payroll: <b>{fmt(managerSalaryTotal(state))}g/cycle</b>.</p>
+      <div className="mgr-list">
+        {rows.map((r) => (
+          <div key={r.role} className="mgr-card">
+            <div className="mgr-info">
+              <b>{r.name}{r.count > 0 && r.role === 'shipping' && ` ×${r.count}`}</b>
+              <span>{r.desc}</span>
+              <span className="mgr-salary">{r.salary}g / cycle each</span>
+            </div>
+            <div className="mgr-actions">
+              <button className="primary" onClick={() => cmd({ kind: 'hireManager', role: r.role })} disabled={r.role !== 'shipping' && r.count > 0}>
+                Hire
+              </button>
+              <button disabled={r.count === 0} onClick={() => cmd({ kind: 'fireManager', role: r.role })}>Fire</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function GoldTab({ state, cmd, goldQty, setGoldQty }: { state: GameState; cmd: (c: Command) => void; goldQty: number; setGoldQty: (n: number) => void }) {
+  const pnl = speculationPnL(state);
+  return (
+    <>
+      <h3 className="sub">Gold {state.gold.phase === 'bubble' && <span className="bubble-tag">RALLYING 🔥</span>}</h3>
+      <p className="hint">A speculative asset — drifts up on average, but rallies into bubbles that suddenly pop. You <em>can</em> borrow to buy it. Watch what happens when it crashes.</p>
+      <div className="gold-summary">
+        <div><span className="stat-label">Price</span><span className="stat-value">{state.gold.price.toFixed(1)}g</span></div>
+        <div><span className="stat-label">Held</span><span className="stat-value">{fmt(state.gold.held)}</span></div>
+        <div><span className="stat-label">Value</span><span className="stat-value">{fmt(goldValue(state))}g</span></div>
+        <div><span className="stat-label">Profit/Loss</span><span className={`stat-value ${pnl >= 0 ? 'up' : 'down'}`}>{pnl >= 0 ? '+' : ''}{fmt(pnl)}g</span></div>
+      </div>
+      <PriceChart history={state.gold.history} currentTurn={state.cycle} />
+      <div className="gold-trade">
+        <input type="number" min={1} value={goldQty} onChange={(e) => setGoldQty(Math.max(1, Number(e.target.value)))} />
+        <button className="primary" disabled={state.cash < goldQty * state.gold.price} onClick={() => cmd({ kind: 'buyGold', qty: goldQty })}>Buy · {fmt(goldQty * state.gold.price)}g</button>
+        <button disabled={state.gold.held < goldQty} onClick={() => cmd({ kind: 'sellGold', qty: goldQty })}>Sell · {fmt(goldQty * state.gold.price)}g</button>
+      </div>
+    </>
+  );
+}
+
+function LogTab({ state }: { state: GameState }) {
+  return (
+    <div className="table-scroll">
+      <table className="log-table">
+        <thead><tr><th className="num">Cycle</th><th>Event</th><th className="num">Δ</th></tr></thead>
+        <tbody>
+          {state.ledger.slice().reverse().map((e, i) => (
+            <tr key={state.ledger.length - i}>
+              <td className="num">{e.cycle}</td>
+              <td>{e.label}</td>
+              <td className={`num ${e.deltaG > 0 ? 'up' : e.deltaG < 0 ? 'down' : 'muted'}`}>{e.deltaG === 0 ? '—' : `${e.deltaG > 0 ? '+' : ''}${fmt(e.deltaG)}g`}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function EndReport({ state, scenario, onExit, onReplay }: { state: GameState; scenario: ScenarioConfig; onExit: () => void; onReplay: () => void }) {
+  const nw = netWorth(state);
+  const won = state.outcome === 'won';
+  const pnl = speculationPnL(state);
+  return (
+    <div className="report-overlay">
+      <div className="report-card">
+        <h2 className="report-title">{won ? '🏆 You hit 1,000,000g!' : "⏱ Time's up"}</h2>
+        <p className="report-nw">Final net worth <b>{fmt(nw)}g</b>{state.wonAtSec != null && won && <span> in {mmss(state.wonAtSec)}</span>}</p>
+        <div className="report-totals">
+          <div><span>Interest paid</span><b>{fmt(state.totals.interestPaidG)}g</b></div>
+          <div><span>Tax paid</span><b>{fmt(state.totals.taxPaidG)}g</b></div>
+          <div><span>Salaries paid</span><b>{fmt(state.totals.salariesPaidG)}g</b></div>
+          <div><span>Upkeep paid</span><b>{fmt(state.totals.upkeepPaidG)}g</b></div>
+          <div><span>Speculation P&amp;L</span><b className={pnl >= 0 ? 'up' : 'down'}>{pnl >= 0 ? '+' : ''}{fmt(pnl)}g</b></div>
+        </div>
+        <p className="report-note">
+          {won
+            ? 'You used debt and assets to reach the goal a saver never could. The ghost comparison chart lands in the next build.'
+            : 'You ran the clock. Try borrowing earlier and bigger — a well-sized loan buys income that pays for itself.'}
+        </p>
+        <div className="report-actions">
+          <button className="primary" onClick={onReplay}>Play again ({scenario.name})</button>
+          <button onClick={onExit}>Change scenario</button>
+        </div>
+      </div>
+    </div>
+  );
+}
