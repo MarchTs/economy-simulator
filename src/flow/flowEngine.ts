@@ -8,8 +8,8 @@
 // Money is on the board too. The Budget is the global cash every build is
 // paid from; place as many Budget blocks as you like, they all show that one balance. Wallets hold money; a Wallet or the Budget pays the upkeep of
 // the blocks wired to it, and a block nobody pays stops. A Borrower is a
-// loan: it pushes its principal down a money wire, and collects each
-// installment from the Wallet or Budget wired into it. Money wires either
+// loan: taking it pays the whole amount into the Budget, and its block
+// collects each installment from the Wallet or Budget wired into it. Money wires either
 // FLOW (into a Wallet or the Budget, continuously, with no limit) or PAY
 // (into any other block, drawn only when a bill falls due).
 // Pure functions over a JSON-serializable FlowState, like the classic engine.
@@ -39,7 +39,8 @@ export interface FlowNode {
   madeLastSec: number;
   soldLastSec: number; // market only: g earned last second
   rr: number; // round-robin cursor over outgoing wires
-  money: number; // wallet balance, market takings not yet collected, borrower principal not yet sent
+  distribution?: Distribution; // how output is split across its wires; absent = 'balance'
+  money: number; // wallet balance, or market takings not yet collected
   unpaid: number; // upkeep owed and not yet paid; the block stops while this is > 0
   loan: FlowLoan | null; // borrower only
   demand: number; // supplier only: units/second the player has it buy
@@ -52,6 +53,19 @@ export interface Wire {
   productId: string; // a good, or MONEY
   level: number;
   movedLastSec: number; // units for goods, gold for money
+  enabled?: boolean; // a switched-off wire carries and pays nothing; absent = on
+}
+
+// 'balance' splits a block's output evenly across its wires; 'priority' fills
+// the top wire first and only spills to the next when that one can't take more.
+export type Distribution = 'balance' | 'priority';
+
+export function isOn(w: Wire): boolean {
+  return w.enabled !== false;
+}
+
+export function distributionOf(n: FlowNode): Distribution {
+  return n.distribution ?? 'balance';
 }
 
 export interface FlowMarketEntry {
@@ -85,6 +99,19 @@ export interface FlowState {
   totals: { salesG: number; upkeepG: number; loanPaidG: number; suppliesG: number };
   rngState: number;
   nextId: number;
+  insolvent: boolean; // equity was below zero at the last bill; still below at the next one means liquidation
+  licenses: string[]; // facility types you may build; the starting one is free
+  bankruptcy: FlowBankruptcy | null; // the most recent liquidation, for the report
+}
+
+export interface FlowBankruptcy {
+  sec: number;
+  count: number; // how many times this run
+  seizedG: number; // money taken from the Budget, Wallets and Markets
+  sold: string[]; // names of the blocks the creditors sold
+  soldG: number;
+  forgivenG: number; // debt still owed after everything was sold, written off
+  kept: string[]; // what the creditors left you
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +142,7 @@ export const SUPPLIER_UPKEEP = 4; // per unit/second of demand, rounded up
 export const STARTER_WALLET_FUND = 100;
 const EPS = 1e-9;
 export const FLOW_LOAN_TERM = 20; // bills
+export const LICENSE_COST_FACTOR = 0.5; // a facility's license costs this × its build cost, once
 
 // The classic game's loans, repaid over FLOW_LOAN_TERM bills: same amount
 // borrowed, same total repaid, bigger installments.
@@ -165,9 +193,11 @@ export function isUpgradable(node: FlowNode): boolean {
   return node.kind === 'facility';
 }
 
-// Every block emits at most one thing: a good, or money.
+// Every block emits at most one thing: a good, or money. A Borrower emits
+// nothing: its money went straight into the Budget when the loan was taken.
 export function outputOf(node: FlowNode): string | null {
   if (node.kind === 'facility' || node.kind === 'supplier') return node.productId;
+  if (node.kind === 'borrower') return null;
   return MONEY;
 }
 
@@ -241,7 +271,8 @@ export function nodeName(node: FlowNode, scenario: ScenarioConfig): string {
 // Why `from`'s output can't plug into `to`, or null when it can. Ignores cost and duplicates.
 export function connectRule(from: FlowNode, to: FlowNode, scenario: ScenarioConfig): string | null {
   if (from.id === to.id) return "A block can't feed itself";
-  const out = outputOf(from)!;
+  const out = outputOf(from);
+  if (out === null) return `${nodeName(from, scenario)} has nothing to send`;
   if (out !== MONEY) {
     if (to.kind === 'market') return null;
     if (to.kind === 'facility' && nodeInputs(to, scenario).some((i) => i.id === out)) return null;
@@ -256,9 +287,9 @@ export function connectRule(from: FlowNode, to: FlowNode, scenario: ScenarioConf
     if (to.kind === 'wallet') return "Wallets don't feed each other. Move money through the Budget";
     return null; // a block's upkeep, a Borrower's installments, or a sweep into the Budget
   }
-  // Market takings and borrowed principal can only be collected.
+  // Market takings can only be collected.
   if (to.kind === 'wallet' || to.kind === 'budget') return null;
-  return from.kind === 'market' ? 'Market takings go to a Wallet or the Budget' : 'Borrowed money goes to a Wallet or the Budget';
+  return 'Market takings go to a Wallet or the Budget';
 }
 
 export function canConnect(state: FlowState, scenario: ScenarioConfig, fromId: string, toId: string): string | null {
@@ -280,6 +311,49 @@ export function debt(state: FlowState): number {
   return borrowers(state).reduce((s, n) => s + n.loan!.balance + n.loan!.arrears, 0);
 }
 
+// Everything you own minus everything you owe: money in the Budget, Wallets
+// and uncollected Market takings, goods in buffers at today's spot price, and
+// each block's resale value, less every loan's balance and arrears.
+export function equity(state: FlowState): number {
+  let owned = state.cash;
+  for (const n of state.nodes) {
+    owned += n.money + n.invested * NODE_RESALE_RATE;
+    if (n.productId) owned += n.outBuf * state.market[n.productId].price;
+    for (const [id, q] of Object.entries(n.inBuf)) owned += q * state.market[id].price;
+  }
+  return owned - debt(state);
+}
+
+// ---------------------------------------------------------------------------
+// Licenses: a facility can only be built once its license is bought, and a
+// license needs the licenses of the facilities making its inputs first, so
+// the tree follows the recipe chain.
+// ---------------------------------------------------------------------------
+
+export function licenseCost(scenario: ScenarioConfig, facilityType: string): number {
+  return Math.round((facilityDef(scenario, facilityType).buildCost * LICENSE_COST_FACTOR) / 10) * 10;
+}
+
+// The facility types whose licenses come first: whoever makes this one's inputs.
+export function licensePrereqs(scenario: ScenarioConfig, facilityType: string): string[] {
+  const inputs = product(scenario, facilityDef(scenario, facilityType).productId).inputs;
+  return inputs.map((i) => scenario.facilityTypes.find((f) => f.productId === i.id)?.type).filter((t): t is string => !!t);
+}
+
+export function hasLicense(state: FlowState, facilityType: string): boolean {
+  return state.licenses.includes(facilityType);
+}
+
+// Why this license can't be bought right now, or null when it can.
+export function licenseBlocker(state: FlowState, scenario: ScenarioConfig, facilityType: string): string | null {
+  if (hasLicense(state, facilityType)) return 'Already owned';
+  const missing = licensePrereqs(scenario, facilityType).filter((t) => !hasLicense(state, t));
+  if (missing.length) return `Needs ${missing.map((t) => facilityDef(scenario, t).name).join(' and ')} first`;
+  const cost = licenseCost(scenario, facilityType);
+  if (state.cash < cost) return `Needs ${cost}g in the Budget`;
+  return null;
+}
+
 export function hasArrears(state: FlowState): boolean {
   return borrowers(state).some((n) => n.loan!.arrears > 0);
 }
@@ -292,7 +366,7 @@ export function payersOf(state: FlowState, node: FlowNode): Payer[] {
   if (node.kind === 'budget') return [];
   const out: Payer[] = [];
   for (const w of state.wires) {
-    if (w.to !== node.id || w.productId !== MONEY) continue;
+    if (w.to !== node.id || w.productId !== MONEY || !isOn(w)) continue;
     const from = state.nodes.find((n) => n.id === w.from);
     if (from && (from.kind === 'wallet' || from.kind === 'budget')) out.push({ node: from, wire: w });
   }
@@ -326,7 +400,7 @@ function draw(state: FlowState, payers: Payer[], amount: number): number {
 export function walletReserve(state: FlowState, wallet: FlowNode, scenario: ScenarioConfig): number {
   let r = nodeUpkeep(wallet, scenario) + wallet.unpaid;
   for (const w of state.wires) {
-    if (w.from !== wallet.id || !isPayLink(state, w)) continue;
+    if (w.from !== wallet.id || !isPayLink(state, w) || !isOn(w)) continue;
     const to = state.nodes.find((n) => n.id === w.to)!;
     r += to.kind === 'borrower' ? Math.min(to.loan!.installmentPerCycle, to.loan!.balance) + to.loan!.arrears : nodeUpkeep(to, scenario) + to.unpaid;
   }
@@ -376,6 +450,9 @@ export function newFlowGame(scenario: ScenarioConfig, opts: { seed: number }): F
     totals: { salesG: 0, upkeepG: 0, loanPaidG: 0, suppliesG: 0 },
     rngState: opts.seed >>> 0,
     nextId: 1,
+    insolvent: false,
+    licenses: [scenario.startingFacilityType],
+    bankruptcy: null,
   };
   const start = facilityDef(scenario, scenario.startingFacilityType);
   state.nodes.push(makeNode(state, 'facility', 80, 160, start.type, start.productId, start.buildCost));
@@ -459,46 +536,55 @@ export function tickFlow(prev: FlowState, scenario: ScenarioConfig): FlowState {
     } else n.status = 'running';
   }
 
-  // 2. Transport: each node pushes its output down its wires, one unit at a
-  // time round-robin, so a split feeds every branch evenly.
+  // 2. Transport: each node pushes its output down its switched-on wires, one
+  // unit at a time. Balance goes round-robin so a split feeds every branch
+  // evenly; priority fills each wire, top first, before trying the next.
   const byId = new Map(state.nodes.map((n) => [n.id, n]));
+  // Move one unit down `w` if the wire and its target have room.
+  const pushOne = (n: FlowNode, w: Wire): boolean => {
+    if (n.outBuf <= 0 || w.movedLastSec >= wireCapacity(w)) return false;
+    const to = byId.get(w.to)!;
+    if (to.kind === 'market') {
+      if (to.unpaid > EPS) return false; // a stopped market buys nothing
+      const earned = salePrice(state, scenario, w.productId);
+      state.market[w.productId].glut += 1;
+      to.money += earned; // waits in the market until a money wire collects it
+      state.totals.salesG += earned;
+      to.soldLastSec += earned;
+    } else {
+      if ((to.inBuf[w.productId] ?? 0) >= bufferCap(to)) return false;
+      to.inBuf[w.productId] = (to.inBuf[w.productId] ?? 0) + 1;
+    }
+    n.outBuf -= 1;
+    w.movedLastSec += 1;
+    return true;
+  };
   for (const n of state.nodes) {
-    const outs = state.wires.filter((w) => w.from === n.id && w.productId !== MONEY);
+    const outs = state.wires.filter((w) => w.from === n.id && w.productId !== MONEY && isOn(w));
     if (outs.length === 0 || n.outBuf <= 0) continue;
+    if (distributionOf(n) === 'priority') {
+      for (const w of outs) while (pushOne(n, w));
+      continue;
+    }
     let progress = true;
     while (n.outBuf > 0 && progress) {
       progress = false;
-      for (let k = 0; k < outs.length && n.outBuf > 0; k++) {
-        const w = outs[(n.rr + k) % outs.length];
-        if (w.movedLastSec >= wireCapacity(w)) continue;
-        const to = byId.get(w.to)!;
-        if (to.kind === 'market') {
-          if (to.unpaid > EPS) continue; // a stopped market buys nothing
-          const earned = salePrice(state, scenario, w.productId);
-          state.market[w.productId].glut += 1;
-          to.money += earned; // waits in the market until a money wire collects it
-          state.totals.salesG += earned;
-          to.soldLastSec += earned;
-        } else {
-          if ((to.inBuf[w.productId] ?? 0) >= bufferCap(to)) continue;
-          to.inBuf[w.productId] = (to.inBuf[w.productId] ?? 0) + 1;
-        }
-        n.outBuf -= 1;
-        w.movedLastSec += 1;
-        progress = true;
-      }
+      for (let k = 0; k < outs.length && n.outBuf > 0; k++) if (pushOne(n, outs[(n.rr + k) % outs.length])) progress = true;
       n.rr = (n.rr + 1) % outs.length;
     }
   }
   for (const n of state.nodes) if (n.kind === 'market' && n.unpaid <= EPS) n.status = n.soldLastSec > 0 ? 'running' : 'idle';
 
-  // 3. Money moves along its flow wires (into Wallets and the Budget) all at
-  // once, split evenly between them. A Wallet keeps back its next bill.
+  // 3. Money moves along its switched-on flow wires (into Wallets and the
+  // Budget) all at once: split evenly in balance, all down the top wire in
+  // priority (a money wire has no limit, so the top one takes everything).
+  // A Wallet keeps back its next bill.
   for (const n of state.nodes) {
-    if (n.kind !== 'market' && n.kind !== 'wallet' && n.kind !== 'borrower') continue;
+    if (n.kind !== 'market' && n.kind !== 'wallet') continue;
     const send = n.kind === 'wallet' ? Math.max(0, n.money - walletReserve(state, n, scenario)) : n.money;
-    const flows = state.wires.filter((w) => w.from === n.id && w.productId === MONEY && !isPayLink(state, w));
+    let flows = state.wires.filter((w) => w.from === n.id && w.productId === MONEY && isOn(w) && !isPayLink(state, w));
     if (send <= EPS || !flows.length) continue;
+    if (distributionOf(n) === 'priority') flows = flows.slice(0, 1);
     const share = send / flows.length;
     for (const w of flows) {
       const to = byId.get(w.to)!;
@@ -520,11 +606,24 @@ export function tickFlow(prev: FlowState, scenario: ScenarioConfig): FlowState {
 function settle(state: FlowState, scenario: ScenarioConfig) {
   state.cycle += 1;
 
-  // Upkeep: every block bills the Wallets and Budget wired into it; whatever they can't cover stops it.
+  // Upkeep: every block bills the Wallets and Budget wired into it; whatever
+  // they can't cover stops it. Wallets pay themselves first, then the blocks
+  // they pay in their wires' top-to-bottom order, so a short Wallet keeps the
+  // top of its list running.
   let paidUpkeep = 0;
   let stopped = 0;
   const budgetBefore = state.cash;
-  for (const n of state.nodes) {
+  const payRank = (n: FlowNode) => {
+    if (n.kind === 'wallet') return -1;
+    let best = Infinity;
+    for (const w of state.wires) {
+      if (w.to !== n.id || w.productId !== MONEY || !isOn(w)) continue;
+      const rank = state.wires.filter((x) => x.from === w.from).indexOf(w);
+      best = Math.min(best, rank);
+    }
+    return best;
+  };
+  for (const n of [...state.nodes].sort((a, b) => payRank(a) - payRank(b))) {
     const due = nodeUpkeep(n, scenario);
     if (due <= 0) continue;
     n.unpaid += due;
@@ -557,6 +656,16 @@ function settle(state: FlowState, scenario: ScenarioConfig) {
     if (l.balance <= EPS && l.arrears <= EPS) retireBorrower(state, n);
   }
 
+  // Solvency: one bill's grace below zero equity, then the creditors liquidate.
+  const eq = equity(state);
+  if (eq >= 0) {
+    if (state.insolvent) addLedger(state, 'Back above water. Equity is positive again', 0);
+    state.insolvent = false;
+  } else if (!state.insolvent) {
+    state.insolvent = true;
+    addLedger(state, `Insolvent: you owe ${Math.round(-eq)}g more than you own. Fix it by the next bill or creditors liquidate`, 0);
+  } else liquidate(state, scenario);
+
   for (const p of scenario.products) {
     const m = state.market[p.id];
     const r = randomRange(state.rngState, -0.05, 0.05);
@@ -569,12 +678,80 @@ function settle(state: FlowState, scenario: ScenarioConfig) {
   state.rngState = nextRandom(state.rngState).nextState;
 }
 
-// A paid-off loan leaves the board; any principal it never sent goes to the Budget.
-function retireBorrower(state: FlowState, n: FlowNode) {
-  state.cash += n.money;
+// Bankruptcy. The creditors seize every coin (Budget, Wallets, Market
+// takings), then sell your most valuable blocks first until the debt is
+// covered, and forgive whatever is still owed. They leave you your cheapest
+// Farm and Market, and a Wallet holding STARTER_WALLET_FUND to pay their upkeep.
+function liquidate(state: FlowState, scenario: ScenarioConfig) {
+  const owed = debt(state);
+  const cheapest = (nodes: FlowNode[]) => nodes.reduce<FlowNode | null>((a, n) => (!a || n.invested < a.invested ? n : a), null);
+  const farm = cheapest(state.nodes.filter((n) => n.kind === 'facility' && nodeInputs(n, scenario).length === 0));
+  const market = cheapest(state.nodes.filter((n) => n.kind === 'market'));
+  // Prefer a Wallet already paying for what you keep, so its wires survive.
+  const wallets = state.nodes.filter((n) => n.kind === 'wallet');
+  const keptWallet =
+    wallets.find((w) => state.wires.some((x) => x.from === w.id && (x.to === farm?.id || x.to === market?.id))) ?? cheapest(wallets);
+  const kept = new Set([farm?.id, market?.id, keptWallet?.id].filter((id): id is string => !!id));
+
+  let pool = state.cash;
+  state.cash = 0;
+  for (const n of state.nodes) {
+    pool += n.money;
+    n.money = 0;
+  }
+  const seizedG = pool;
+
+  const sold: string[] = [];
+  let soldG = 0;
+  const forSale = state.nodes
+    .filter((n) => !kept.has(n.id) && n.kind !== 'budget' && n.kind !== 'borrower')
+    .sort((a, b) => b.invested - a.invested);
+  for (const n of forSale) {
+    if (pool >= owed) break;
+    const proceeds = n.invested * NODE_RESALE_RATE;
+    pool += proceeds;
+    soldG += proceeds;
+    sold.push(nodeName(n, scenario));
+    state.nodes = state.nodes.filter((x) => x.id !== n.id);
+    state.wires = state.wires.filter((w) => w.from !== n.id && w.to !== n.id);
+  }
+
+  const forgivenG = Math.max(0, owed - pool);
+  state.totals.loanPaidG += Math.min(pool, owed);
+  state.cash = Math.max(0, pool - owed);
+  for (const b of borrowers(state)) {
+    state.nodes = state.nodes.filter((x) => x.id !== b.id);
+    state.wires = state.wires.filter((w) => w.from !== b.id && w.to !== b.id);
+  }
+
+  // A fresh start for what's left: nothing owed on upkeep, and a funded Wallet.
+  for (const n of state.nodes) n.unpaid = 0;
+  let wallet = state.nodes.find((n) => n.id === keptWallet?.id);
+  if (!wallet) {
+    wallet = makeNode(state, 'wallet', farm?.x ?? 80, (farm?.y ?? 160) + 200, null, null, 0);
+    state.nodes.push(wallet);
+  }
+  wallet.money = STARTER_WALLET_FUND;
+
+  state.insolvent = false;
+  state.bankruptcy = {
+    sec: state.clockSec,
+    count: (state.bankruptcy?.count ?? 0) + 1,
+    seizedG,
+    sold,
+    soldG,
+    forgivenG,
+    kept: state.nodes.filter((n) => n.kind !== 'budget').map((n) => nodeName(n, scenario)),
+  };
+  addLedger(state, `Bankrupt: creditors seized ${Math.round(seizedG)}g, sold ${sold.length} block${sold.length === 1 ? '' : 's'} and forgave ${Math.round(forgivenG)}g`, 0);
+}
+
+// A paid-off loan leaves the board, with its wires. `note` is false when the
+// caller has already written the ledger line for the payment that cleared it.
+function retireBorrower(state: FlowState, n: FlowNode, note = true) {
   state.nodes = state.nodes.filter((x) => x.id !== n.id);
   state.wires = state.wires.filter((w) => w.from !== n.id && w.to !== n.id);
-  addLedger(state, `Paid off the ${n.loan!.label} loan`, n.money);
+  if (note) addLedger(state, `Paid off the ${n.loan!.label} loan`, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +761,7 @@ function retireBorrower(state: FlowState, n: FlowNode) {
 export type FlowCommand =
   | { kind: 'buildFacility'; facilityType: string; x: number; y: number }
   | { kind: 'buildMarket'; x: number; y: number }
+  | { kind: 'buyLicense'; facilityType: string }
   | { kind: 'buildSupplier'; productId: string; x: number; y: number }
   | { kind: 'buildWallet'; fund: number; x: number; y: number }
   | { kind: 'setDemand'; nodeId: string; demand: number } // supplier: units/second to buy
@@ -591,11 +769,15 @@ export type FlowCommand =
   | { kind: 'transferMoney'; nodeId: string; amount: number } // + Budget → Wallet, − Wallet → Budget
   | { kind: 'connect'; from: string; to: string }
   | { kind: 'removeWire'; wireId: string }
+  | { kind: 'setDistribution'; nodeId: string; mode: Distribution }
+  | { kind: 'toggleWire'; wireId: string }
+  | { kind: 'moveWire'; wireId: string; dir: -1 | 1 } // up or down this block's priority list
   | { kind: 'upgradeWire'; wireId: string }
   | { kind: 'levelUp'; nodeId: string }
   | { kind: 'sellNode'; nodeId: string }
   | { kind: 'takeLoan'; offerId: string; x: number; y: number }
-  | { kind: 'payArrears'; nodeId: string }; // from the Budget
+  | { kind: 'payArrears'; nodeId: string } // from the Budget
+  | { kind: 'payOffLoan'; nodeId: string }; // everything still owed, from the Budget
 
 export function applyFlowCommand(prev: FlowState, cmd: FlowCommand, scenario: ScenarioConfig): FlowState {
   const state = structuredClone(prev);
@@ -609,8 +791,14 @@ export function applyFlowCommand(prev: FlowState, cmd: FlowCommand, scenario: Sc
   switch (cmd.kind) {
     case 'buildFacility': {
       const def = facilityDef(scenario, cmd.facilityType);
-      if (!def || !spend(def.buildCost, `Built ${def.name}`)) break;
+      if (!def || !hasLicense(state, def.type) || !spend(def.buildCost, `Built ${def.name}`)) break;
       state.nodes.push(makeNode(state, 'facility', cmd.x, cmd.y, def.type, def.productId, def.buildCost));
+      break;
+    }
+    case 'buyLicense': {
+      if (!facilityDef(scenario, cmd.facilityType) || licenseBlocker(state, scenario, cmd.facilityType)) break;
+      spend(licenseCost(scenario, cmd.facilityType), `Bought the ${facilityDef(scenario, cmd.facilityType).name} license`);
+      state.licenses.push(cmd.facilityType);
       break;
     }
     case 'buildMarket': {
@@ -662,7 +850,29 @@ export function applyFlowCommand(prev: FlowState, cmd: FlowCommand, scenario: Sc
       if (canConnect(state, scenario, cmd.from, cmd.to)) break;
       const from = state.nodes.find((n) => n.id === cmd.from)!;
       state.cash -= WIRE_COST;
-      state.wires.push({ id: genId(state, 'wire'), from: cmd.from, to: cmd.to, productId: outputOf(from)!, level: 1, movedLastSec: 0 });
+      state.wires.push({ id: genId(state, 'wire'), from: cmd.from, to: cmd.to, productId: outputOf(from)!, level: 1, movedLastSec: 0, enabled: true });
+      break;
+    }
+    case 'setDistribution': {
+      const n = state.nodes.find((x) => x.id === cmd.nodeId);
+      if (n) n.distribution = cmd.mode;
+      break;
+    }
+    case 'toggleWire': {
+      const w = state.wires.find((x) => x.id === cmd.wireId);
+      if (w) w.enabled = !isOn(w);
+      break;
+    }
+    case 'moveWire': {
+      // Swap with the neighbouring wire from the same block; that order is the priority order.
+      const w = state.wires.find((x) => x.id === cmd.wireId);
+      if (!w) break;
+      const siblings = state.wires.filter((x) => x.from === w.from);
+      const other = siblings[siblings.indexOf(w) + cmd.dir];
+      if (!other) break;
+      const i = state.wires.indexOf(w);
+      const j = state.wires.indexOf(other);
+      [state.wires[i], state.wires[j]] = [state.wires[j], state.wires[i]];
       break;
     }
     case 'removeWire': {
@@ -700,10 +910,22 @@ export function applyFlowCommand(prev: FlowState, cmd: FlowCommand, scenario: Sc
       const offer = FLOW_LOAN_OFFERS.find((o) => o.id === cmd.offerId);
       if (!offer) break;
       const b = makeNode(state, 'borrower', cmd.x, cmd.y, null, null, 0);
-      b.money = offer.principal;
       b.loan = { label: offer.label, balance: offer.totalRepay, installmentPerCycle: offer.installmentPerCycle, arrears: 0 };
       state.nodes.push(b);
-      addLedger(state, `Took a ${offer.label} loan of ${offer.principal}g. Wire its Borrower to a Wallet or the Budget`, 0);
+      state.cash += offer.principal;
+      addLedger(state, `Took a ${offer.label} loan. Wire a Wallet or the Budget into it to repay`, offer.principal);
+      break;
+    }
+    case 'payOffLoan': {
+      // Settle everything still owed, arrears included, from the Budget in one go.
+      const n = state.nodes.find((x) => x.id === cmd.nodeId);
+      if (!n?.loan) break;
+      const due = n.loan.balance + n.loan.arrears;
+      if (state.cash < due) break;
+      state.cash -= due;
+      state.totals.loanPaidG += due;
+      addLedger(state, `Paid the ${n.loan.label} loan in full`, -due);
+      retireBorrower(state, n, false);
       break;
     }
     case 'payArrears': {

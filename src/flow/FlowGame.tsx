@@ -9,10 +9,18 @@ import {
   canConnect,
   connectRule,
   debt,
+  distributionOf,
+  facilityDef,
+  equity,
   FLOW_LOAN_OFFERS,
   FLOW_SETTLE_SEC,
   hasArrears,
+  hasLicense,
+  licenseBlocker,
+  licenseCost,
+  licensePrereqs,
   inputRows,
+  isOn,
   isPayLink,
   isUpgradable,
   levelUpCost,
@@ -39,6 +47,7 @@ import {
   wireCapacity,
   wireUpgradeCost,
   WIRE_COST,
+  type FlowBankruptcy,
   type FlowCommand,
   type FlowNode,
   type FlowState,
@@ -54,6 +63,7 @@ const CANVAS_H = 1600;
 const ZOOM_MIN = 0.4;
 const ZOOM_MAX = 2;
 const ZOOM_STEP = 1.2;
+const SEP_H = 9; // the divider between a block's goods inputs and its upkeep dot
 const FOOT_H = 26; // a node card's footer, for fitting the view around nodes
 const MONEY_COLOR = '#f2d16b';
 const PRODUCT_COLORS = ['#e8a33d', '#8fbf6f', '#6fb0d6', '#d68a6f', '#c79be0', '#e0d36f', '#6fd6c0', '#e06c9b'];
@@ -72,11 +82,19 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
   const [drag, setDrag] = useState<Drag>(null);
   const [cursor, setCursor] = useState({ x: 0, y: 0 });
   const [toast, setToast] = useState<string | null>(null);
+  const [seenBankruptcy, setSeenBankruptcy] = useState<number | null>(null);
+  const bankruptAt = state.bankruptcy?.sec ?? null;
+  const showBankruptcy = bankruptAt !== null && bankruptAt !== seenBankruptcy;
+  // Hold the clock while the bankruptcy report is open.
+  useEffect(() => {
+    if (showBankruptcy) setPaused(true);
+  }, [showBankruptcy]);
   const [supplierProduct, setSupplierProduct] = useState(scenario.products[0].id);
   const [walletFund, setWalletFund] = useState(100);
   const [zoom, setZoom] = useState(1);
   const [infoOpen, setInfoOpen] = useState(true);
   const [buildOpen, setBuildOpen] = useState(true);
+  const [licensesOpen, setLicensesOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const zoomRef = useRef(zoom);
@@ -144,7 +162,7 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
     const minX = Math.min(...state.nodes.map((n) => n.x)) - pad;
     const minY = Math.min(...state.nodes.map((n) => n.y)) - pad;
     const maxX = Math.max(...state.nodes.map((n) => n.x + NODE_W)) + pad;
-    const maxY = Math.max(...state.nodes.map((n) => n.y + HEADER + ROW * layouts.get(n.id)!.rows + FOOT_H)) + pad;
+    const maxY = Math.max(...state.nodes.map((n) => n.y + HEADER + portsHeight(layouts.get(n.id)!) + FOOT_H)) + pad;
     const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.min(w.clientWidth / (maxX - minX), w.clientHeight / (maxY - minY))));
     pendingScroll.current = {
       left: ((minX + maxX) / 2) * next - w.clientWidth / 2,
@@ -228,6 +246,10 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
           <span className="stat-label">Budget</span>
           <span className={'cash-value' + (state.cash < 0 ? ' negative' : '')}>{fmt(state.cash)}g</span>
         </div>
+        <div className="stat" title="Everything you own minus everything you owe. Below 0 at two bills in a row and the creditors liquidate.">
+          <span className="stat-label">{state.insolvent ? 'Equity · insolvent' : 'Equity'}</span>
+          <span className={'stat-value' + (equity(state) < 0 ? ' down' : '')}>{fmt(equity(state))}g</span>
+        </div>
         <div className="stat">
           <span className="stat-label">Selling</span>
           <span className="stat-value up">+{fmt(salesPerSec)}g/s</span>
@@ -247,6 +269,7 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
               {x}×
             </button>
           ))}
+          <button onClick={() => setLicensesOpen(true)}>Licenses</button>
           <button className={'flow-toggle' + (buildOpen ? ' active' : '')} aria-pressed={buildOpen} onClick={() => setBuildOpen((o) => !o)}>
             Build
           </button>
@@ -261,27 +284,40 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
         {buildOpen && (
           <aside className="flow-panel flow-palette">
             <InspectorHead title="Build" onClose={() => setBuildOpen(false)} />
-            {scenario.facilityTypes.map((def) => {
-              const p = product(scenario, def.productId);
-              return (
-                <button
-                  key={def.type}
-                  className="palette-item"
-                  disabled={state.cash < def.buildCost}
-                  onClick={() => cmd({ kind: 'buildFacility', facilityType: def.type, ...spawnPoint() })}
-                >
+            {scenario.facilityTypes
+              .filter((def) => hasLicense(state, def.type))
+              .map((def) => {
+                const p = product(scenario, def.productId);
+                return (
+                  <button
+                    key={def.type}
+                    className="palette-item"
+                    disabled={state.cash < def.buildCost}
+                    onClick={() => cmd({ kind: 'buildFacility', facilityType: def.type, ...spawnPoint() })}
+                  >
+                    <span className="palette-top">
+                      <span className="swatch" style={{ background: colorOf(p.id) }} />
+                      <b>{def.name}</b>
+                      <span className="cost">{fmt(def.buildCost)}g</span>
+                    </span>
+                    <span className="palette-sub">
+                      {p.inputs.length ? p.inputs.map((i) => `${i.qty} ${product(scenario, i.id).name}`).join(' + ') + ' → ' : ''}
+                      {p.name} · {def.baseRatePerSec}/s
+                    </span>
+                  </button>
+                );
+              })}
+            {(() => {
+              const locked = scenario.facilityTypes.filter((def) => !hasLicense(state, def.type)).length;
+              return locked > 0 ? (
+                <button className="palette-item locked" onClick={() => setLicensesOpen(true)}>
                   <span className="palette-top">
-                    <span className="swatch" style={{ background: colorOf(p.id) }} />
-                    <b>{def.name}</b>
-                    <span className="cost">{fmt(def.buildCost)}g</span>
+                    <b>🔒 {locked} more {locked === 1 ? 'facility' : 'facilities'}</b>
                   </span>
-                  <span className="palette-sub">
-                    {p.inputs.length ? p.inputs.map((i) => `${i.qty} ${product(scenario, i.id).name}`).join(' + ') + ' → ' : ''}
-                    {p.name} · {def.baseRatePerSec}/s
-                  </span>
+                  <span className="palette-sub">Buy their licenses to build them. Opens the license tree.</span>
                 </button>
-              );
-            })}
+              ) : null;
+            })()}
             <button className="palette-item" disabled={state.cash < MARKET_COST} onClick={() => cmd({ kind: 'buildMarket', ...spawnPoint() })}>
               <span className="palette-top">
                 <span className="swatch market" />
@@ -386,8 +422,8 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
                     const from = nodeById.get(w.from);
                     const to = nodeById.get(w.to);
                     if (!from || !to) return null;
-                    const a = portPoint(from, layouts.get(from.id)!.outs, w.id, 'out');
-                    const b = portPoint(to, layouts.get(to.id)!.ins, w.id, 'in');
+                    const a = portPoint(from, layouts.get(from.id)!, 'out', w.id);
+                    const b = portPoint(to, layouts.get(to.id)!, 'in', w.id);
                     return (
                       <WirePath
                         key={w.id}
@@ -402,7 +438,7 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
                     );
                   })}
                   {dragFrom && (
-                    <path className="wire-pending" d={curve(portPoint(dragFrom, layouts.get(dragFrom.id)!.outs, null, 'out'), cursor)} stroke={colorOf(outputOf(dragFrom)!)} />
+                    <path className="wire-pending" d={curve(portPoint(dragFrom, layouts.get(dragFrom.id)!, 'out', null), cursor)} stroke={colorOf(outputOf(dragFrom) ?? MONEY)} />
                   )}
                 </svg>
 
@@ -464,6 +500,130 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
         )}
       </div>
 
+      {licensesOpen && <LicenseTree state={state} scenario={scenario} colorOf={colorOf} cmd={cmd} onClose={() => setLicensesOpen(false)} />}
+
+      {showBankruptcy && (
+        <BankruptcyReport
+          report={state.bankruptcy!}
+          onClose={() => {
+            setSeenBankruptcy(bankruptAt);
+            setPaused(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// The license tree: one column per product tier, each license linked from the
+// licenses it needs. Buying one lets you build that facility from the Build panel.
+const LIC_W = 190;
+const LIC_H = 92;
+const LIC_GAP_X = 64;
+const LIC_GAP_Y = 22;
+
+function LicenseTree({
+  state,
+  scenario,
+  colorOf,
+  cmd,
+  onClose,
+}: {
+  state: FlowState;
+  scenario: ScenarioConfig;
+  colorOf: (id: string) => string;
+  cmd: (c: FlowCommand) => void;
+  onClose: () => void;
+}) {
+  const tierOf = (type: string) => product(scenario, facilityDef(scenario, type).productId).tier;
+  const tiers = [...new Set(scenario.facilityTypes.map((f) => tierOf(f.type)))].sort((a, b) => a - b);
+  const pos = new Map<string, { x: number; y: number }>();
+  tiers.forEach((t, col) =>
+    scenario.facilityTypes
+      .filter((f) => tierOf(f.type) === t)
+      .forEach((f, row) => pos.set(f.type, { x: col * (LIC_W + LIC_GAP_X), y: row * (LIC_H + LIC_GAP_Y) })),
+  );
+  const width = tiers.length * (LIC_W + LIC_GAP_X) - LIC_GAP_X;
+  const height = Math.max(...[...pos.values()].map((p) => p.y)) + LIC_H;
+
+  return (
+    <div className="report-overlay" role="dialog" aria-modal="true" aria-labelledby="licenses-title" onClick={onClose}>
+      <div className="license-card" onClick={(e) => e.stopPropagation()}>
+        <InspectorHead title="Licenses" onClose={onClose} />
+        <p className="hint" id="licenses-title">
+          Buy a facility’s license once, from the Budget, to build it. A license needs the licenses of whatever makes its inputs.
+          Budget: <b>{fmt(state.cash)}g</b>
+        </p>
+        <div className="license-scroll">
+          <div className="license-tree" style={{ width, height }}>
+            <svg className="license-lines" width={width} height={height}>
+              {scenario.facilityTypes.flatMap((f) =>
+                licensePrereqs(scenario, f.type).map((pre) => {
+                  const a = pos.get(pre)!;
+                  const b = pos.get(f.type)!;
+                  return (
+                    <path
+                      key={`${pre}-${f.type}`}
+                      className={hasLicense(state, pre) ? 'met' : ''}
+                      d={curve({ x: a.x + LIC_W, y: a.y + LIC_H / 2 }, { x: b.x, y: b.y + LIC_H / 2 })}
+                    />
+                  );
+                }),
+              )}
+            </svg>
+            {scenario.facilityTypes.map((f) => {
+              const p = pos.get(f.type)!;
+              const owned = hasLicense(state, f.type);
+              const why = licenseBlocker(state, scenario, f.type);
+              const prereqsMet = !licensePrereqs(scenario, f.type).some((t) => !hasLicense(state, t));
+              return (
+                <div
+                  key={f.type}
+                  className={'license' + (owned ? ' owned' : prereqsMet ? ' ready' : ' locked')}
+                  style={{ left: p.x, top: p.y, width: LIC_W, height: LIC_H }}
+                >
+                  <div className="license-name">
+                    <span className="swatch" style={{ background: colorOf(f.productId) }} />
+                    {f.name}
+                  </div>
+                  <div className="license-sub">Build {fmt(f.buildCost)}g · {product(scenario, f.productId).name}</div>
+                  {owned ? (
+                    <div className="license-owned">✓ Licensed</div>
+                  ) : (
+                    <button className="primary" disabled={!!why} title={why ?? undefined} onClick={() => cmd({ kind: 'buyLicense', facilityType: f.type })}>
+                      {prereqsMet ? `Buy · ${fmt(licenseCost(scenario, f.type))}g` : why}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BankruptcyReport({ report, onClose }: { report: FlowBankruptcy; onClose: () => void }) {
+  return (
+    <div className="report-overlay" role="dialog" aria-modal="true" aria-labelledby="bankrupt-title">
+      <div className="report-card flow-bankrupt">
+        <h2 id="bankrupt-title">Bankrupt{report.count > 1 ? ` (×${report.count})` : ''}</h2>
+        <p>You owed more than everything you owned for two bills running, so the creditors liquidated.</p>
+        <dl className="facts">
+          <dt>Money seized</dt>
+          <dd>{fmt(report.seizedG)}g</dd>
+          <dt>Blocks sold</dt>
+          <dd>{report.sold.length ? `${report.sold.join(', ')} (${fmt(report.soldG)}g)` : 'none'}</dd>
+          <dt>Debt forgiven</dt>
+          <dd>{fmt(report.forgivenG)}g</dd>
+          <dt>You keep</dt>
+          <dd>{report.kept.join(', ') || 'nothing'}</dd>
+        </dl>
+        <button className="primary" onClick={onClose}>
+          Start over with what’s left
+        </button>
+      </div>
     </div>
   );
 }
@@ -509,7 +669,8 @@ type Pt = { x: number; y: number };
 // down the right-hand side.
 type Slot = { key: string; wireId: string | null; row: number };
 type InSlot = Slot & { kind: string; first: boolean };
-type PortLayout = { ins: InSlot[]; outs: Slot[]; rows: number };
+// `sepRow`: the first row of the upkeep group when goods inputs sit above it, else null.
+type PortLayout = { ins: InSlot[]; outs: Slot[]; rows: number; sepRow: number | null };
 
 // Which input group a wire lands in on `node`.
 function inKindOf(node: FlowNode, w: Wire): string {
@@ -519,7 +680,10 @@ function inKindOf(node: FlowNode, w: Wire): string {
 
 function portLayout(node: FlowNode, state: FlowState, scenario: ScenarioConfig): PortLayout {
   const ins: InSlot[] = [];
-  let row = 0;
+  // A producer with no goods inputs (a Farm, a Supplier) gives its output a row
+  // of its own, so the upkeep group sits below the divider like a Market's.
+  const ownOutputRow = (node.kind === 'facility' || node.kind === 'supplier') && nodeInputs(node, scenario).length === 0;
+  let row = ownOutputRow ? 1 : 0;
   for (const kind of inputRows(node, scenario)) {
     const wires = state.wires.filter((w) => w.to === node.id && inKindOf(node, w) === kind);
     wires.forEach((w, i) => ins.push({ key: w.id, kind, wireId: w.id, row: row++, first: i === 0 }));
@@ -527,14 +691,25 @@ function portLayout(node: FlowNode, state: FlowState, scenario: ScenarioConfig):
   }
   const outWires = state.wires.filter((w) => w.from === node.id);
   const outs: Slot[] = outWires.map((w, i) => ({ key: w.id, wireId: w.id, row: i }));
-  outs.push({ key: 'out:free', wireId: null, row: outWires.length });
-  return { ins, outs, rows: Math.max(row, outs.length) };
+  if (outputOf(node) !== null) outs.push({ key: 'out:free', wireId: null, row: outWires.length });
+  const firstMoney = ins.find((s) => s.kind === MONEY)?.row ?? 0;
+  return { ins, outs, rows: Math.max(row, outs.length), sepRow: firstMoney > 0 ? firstMoney : null };
+}
+
+// Pixel offset of a row inside the ports area, counting the divider above the upkeep group.
+function rowTop(layout: PortLayout, row: number): number {
+  return ROW * row + (layout.sepRow !== null && row >= layout.sepRow ? SEP_H : 0);
+}
+
+function portsHeight(layout: PortLayout): number {
+  return rowTop(layout, layout.rows);
 }
 
 // Where a wire meets a block: its own dot, or the free dot when `wireId` is null.
-function portPoint(n: FlowNode, slots: Slot[], wireId: string | null, side: 'in' | 'out'): Pt {
+function portPoint(n: FlowNode, layout: PortLayout, side: 'in' | 'out', wireId: string | null): Pt {
+  const slots: Slot[] = side === 'out' ? layout.outs : layout.ins;
   const slot = slots.find((s) => s.wireId === wireId) ?? slots[slots.length - 1];
-  return { x: side === 'out' ? n.x + NODE_W : n.x, y: n.y + HEADER + ROW * slot.row + ROW / 2 };
+  return { x: side === 'out' ? n.x + NODE_W : n.x, y: n.y + HEADER + rowTop(layout, slot.row) + ROW / 2 };
 }
 
 function curve(a: Pt, b: Pt) {
@@ -570,11 +745,12 @@ function WirePath({
   // Dots travel faster the more the wire carries.
   const dur = wire.movedLastSec > 0 ? Math.max(0.35, 1.6 - load * 1.2) : 0;
   const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-  const label = pay ? 'pays' : money ? `${fmt(wire.movedLastSec)}g/s` : `${wire.movedLastSec}/${cap}`;
+  const on = isOn(wire);
+  const label = !on ? 'off' : pay ? 'pays' : money ? `${fmt(wire.movedLastSec)}g/s` : `${wire.movedLastSec}/${cap}`;
   const labelW = Math.max(44, label.length * 6.5 + 12);
   return (
     <g
-      className={'wire' + (selected ? ' selected' : '') + (load >= 1 ? ' maxed' : '') + (pay ? ' pay' : '')}
+      className={'wire' + (selected ? ' selected' : '') + (load >= 1 ? ' maxed' : '') + (pay ? ' pay' : '') + (on ? '' : ' off')}
       onPointerDown={(e) => (e.stopPropagation(), onSelect())}
     >
       <path className="wire-hit" d={d} />
@@ -622,8 +798,9 @@ function NodeCard({
   onSelect: () => void;
 }) {
   const inputs = batchInputs(node, scenario);
-  const out = outputOf(node)!;
+  const out = outputOf(node);
   const upkeep = nodeUpkeep(node, scenario);
+  const wireOn = (id: string) => isOn(state.wires.find((w) => w.id === id)!);
 
   const inLabel = (id: string) => {
     if (id === '*goods') return <span className="port-label">sells anything</span>;
@@ -646,7 +823,7 @@ function NodeCard({
   };
 
   const outLabel =
-    out !== MONEY ? (
+    out === null ? null : out !== MONEY ? (
       <>
         <span className="buf">{node.outBuf}</span>
         {node.kind === 'facility' && `${batchSize(node)}× `}
@@ -706,18 +883,27 @@ function NodeCard({
     >
       <div className="node-head" style={{ height: HEADER }} onPointerDown={onHeaderDown}>
         <span className="node-title">{nodeName(node, scenario)}</span>
+        {distributionOf(node) === 'priority' && (
+          <span className="node-mode" title="Priority: fills its top wire first">
+            1→
+          </span>
+        )}
         {isUpgradable(node) && <span className="node-level">L{node.level}</span>}
       </div>
-      <div className="node-ports" style={{ height: ROW * layout.rows }}>
+      <div className="node-ports" style={{ height: portsHeight(layout) }}>
         {Array.from({ length: layout.rows }, (_, r) => {
           const inSlot = layout.ins.find((s) => s.row === r);
           const outSlot = layout.outs.find((s) => s.row === r);
           const inColor = inSlot && inSlot.kind !== '*goods' ? colorOf(inSlot.kind) : undefined;
           return (
-            <div key={r} className="port-row" style={{ height: ROW }}>
+            <div
+              key={r}
+              className={'port-row' + (r === layout.sepRow ? ' after-sep' : '')}
+              style={{ height: ROW, marginTop: r === layout.sepRow ? SEP_H : undefined }}
+            >
               {inSlot && (
                 <span
-                  className={'port in' + (inSlot.wireId ? ' linked' : ' free')}
+                  className={'port in' + (inSlot.wireId ? ' linked' : ' free') + (inSlot.wireId && !wireOn(inSlot.wireId) ? ' off' : '')}
                   style={inColor ? { borderColor: inColor, background: inSlot.wireId ? inColor : undefined } : undefined}
                 />
               )}
@@ -730,8 +916,9 @@ function NodeCard({
               )}
               {r === 0 && <span className="port-label out-label">{outLabel}</span>}
               {outSlot &&
+                out !== null &&
                 (outSlot.wireId ? (
-                  <span className="port out linked" style={{ background: colorOf(out) }} />
+                  <span className={'port out linked' + (wireOn(outSlot.wireId) ? '' : ' off')} style={{ background: colorOf(out) }} />
                 ) : (
                   <span className="port out free" style={{ borderColor: colorOf(out) }} onPointerDown={onPortDown} title="Drag to connect" />
                 ))}
@@ -890,6 +1077,61 @@ function BlockInspector({ node, state, scenario, cmd, onClose }: InspectorProps)
         )}
         <SellButton node={node} cmd={cmd} onClose={onClose} />
       </div>
+      <OutputsList node={node} state={state} scenario={scenario} cmd={cmd} />
+    </div>
+  );
+}
+
+// A block's outgoing wires, top to bottom: the order priority mode fills them
+// in, and the order a short Wallet pays its blocks. Each can be switched off.
+function OutputsList({ node, state, scenario, cmd }: { node: FlowNode; state: FlowState; scenario: ScenarioConfig; cmd: (c: FlowCommand) => void }) {
+  const outs = state.wires.filter((w) => w.from === node.id);
+  if (!outs.length) return null;
+  const splits = outs.some((w) => !isPayLink(state, w)); // only flowing output is split by the mode
+  const mode = distributionOf(node);
+  return (
+    <div className="outputs">
+      <div className="outputs-head">
+        <h3>Outputs</h3>
+        {splits && (
+          <div className="seg" role="group" aria-label="How output is split">
+            {(['balance', 'priority'] as const).map((m) => (
+              <button key={m} className={mode === m ? 'active' : ''} aria-pressed={mode === m} onClick={() => cmd({ kind: 'setDistribution', nodeId: node.id, mode: m })}>
+                {m === 'balance' ? 'Balance' : 'Priority'}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      <p className="hint">
+        {splits && mode === 'priority'
+          ? 'Fills the top wire first; the next one only gets what the one above can’t take.'
+          : splits
+            ? 'Splits output evenly across every wire that’s on.'
+            : 'Bills are paid top to bottom when money runs short.'}
+      </p>
+      <ol className="outputs-list">
+        {outs.map((w, i) => {
+          const to = state.nodes.find((n) => n.id === w.to);
+          return (
+            <li key={w.id} className={isOn(w) ? '' : 'off'}>
+              <span className="outputs-name">
+                {to ? nodeName(to, scenario) : '?'}
+                {isPayLink(state, w) && <span className="outputs-tag">pays</span>}
+              </span>
+              <button aria-label="Move up" disabled={i === 0} onClick={() => cmd({ kind: 'moveWire', wireId: w.id, dir: -1 })}>
+                ↑
+              </button>
+              <button aria-label="Move down" disabled={i === outs.length - 1} onClick={() => cmd({ kind: 'moveWire', wireId: w.id, dir: 1 })}>
+                ↓
+              </button>
+              <button className={'outputs-toggle' + (isOn(w) ? ' active' : '')} aria-pressed={isOn(w)} onClick={() => cmd({ kind: 'toggleWire', wireId: w.id })}>
+                {isOn(w) ? 'On' : 'Off'}
+              </button>
+            </li>
+          );
+        })}
+      </ol>
     </div>
   );
 }
@@ -943,11 +1185,12 @@ function WalletInspector({ node, state, scenario, cmd, onClose }: InspectorProps
       <div className="inspector-actions">
         <SellButton node={node} cmd={cmd} onClose={onClose} />
       </div>
+      <OutputsList node={node} state={state} scenario={scenario} cmd={cmd} />
     </div>
   );
 }
 
-function BudgetInspector({ node, state, cmd, onClose }: InspectorProps) {
+function BudgetInspector({ node, state, scenario, cmd, onClose }: InspectorProps) {
   const count = state.nodes.filter((n) => n.kind === 'budget').length;
   return (
     <div className="inspector">
@@ -978,6 +1221,7 @@ function BudgetInspector({ node, state, cmd, onClose }: InspectorProps) {
           </button>
         </div>
       )}
+      <OutputsList node={node} state={state} scenario={scenario} cmd={cmd} />
     </div>
   );
 }
@@ -985,19 +1229,16 @@ function BudgetInspector({ node, state, cmd, onClose }: InspectorProps) {
 function BorrowerInspector({ node, state, cmd, onClose }: InspectorProps) {
   const l = node.loan!;
   const payers = payersOf(state, node);
-  const collecting = state.wires.some((w) => w.from === node.id);
+  const owed = l.balance + l.arrears;
   return (
     <div className="inspector">
       <InspectorHead title={`${l.label} loan`} onClose={onClose} />
-      {node.money >= 1 && !collecting && <p className="hint status-starved">Wire it to a Wallet or the Budget to collect the money.</p>}
       <p className={'hint' + (payers.length ? '' : ' status-unpaid')}>
         {payers.length
           ? `Collects ${l.installmentPerCycle}g every bill from what’s wired into it.`
           : 'Nothing repays it. Wire a Wallet or the Budget into it, or every installment becomes arrears.'}
       </p>
       <dl className="facts">
-        <dt>Still to send</dt>
-        <dd>{fmt(node.money)}g</dd>
         <dt>Left to repay</dt>
         <dd>{fmt(l.balance)}g</dd>
         <dt>Each bill</dt>
@@ -1007,13 +1248,24 @@ function BorrowerInspector({ node, state, cmd, onClose }: InspectorProps) {
         <dt>Upkeep</dt>
         <dd>none</dd>
       </dl>
-      {l.arrears > 0 && (
-        <div className="inspector-actions">
-          <button className="primary" disabled={state.cash <= 0} onClick={() => cmd({ kind: 'payArrears', nodeId: node.id })}>
+      <div className="inspector-actions">
+        {l.arrears > 0 && (
+          <button disabled={state.cash <= 0} onClick={() => cmd({ kind: 'payArrears', nodeId: node.id })}>
             Pay arrears from Budget · {fmt(Math.min(l.arrears, state.cash))}g
           </button>
-        </div>
-      )}
+        )}
+        <button
+          className="primary"
+          disabled={state.cash < owed}
+          title={state.cash < owed ? `The Budget needs ${fmt(owed)}g` : undefined}
+          onClick={() => {
+            cmd({ kind: 'payOffLoan', nodeId: node.id });
+            onClose();
+          }}
+        >
+          Pay in full from Budget · {fmt(owed)}g
+        </button>
+      </div>
     </div>
   );
 }
@@ -1058,6 +1310,7 @@ function WireInspector({
             Double capacity · {fmt(cost)}g
           </button>
         )}
+        <button onClick={() => cmd({ kind: 'toggleWire', wireId: wire.id })}>{isOn(wire) ? 'Switch off' : 'Switch on'}</button>
         <button
           onClick={() => {
             cmd({ kind: 'removeWire', wireId: wire.id });
@@ -1080,9 +1333,13 @@ function Overview({ state, scenario, onClose }: { state: FlowState; scenario: Sc
         <li>Goods flow from farms through processors into a Market. The Market holds its takings until a gold money wire carries them to a Wallet or the Budget.</li>
         <li>Every block’s upkeep is paid by a Wallet or the Budget wired into it (Wallets first). A block nobody pays stops.</li>
         <li>The Budget pays for building. Fund a Wallet when you open it, or move money from the Wallet’s panel.</li>
-        <li>A loan arrives as a Borrower. Wire it out to collect the money, and wire a Wallet or the Budget in to repay it.</li>
+        <li>A loan pays its whole amount into the Budget. Its block collects each installment from a Wallet or the Budget wired into it, or you can pay it off in full from its panel.</li>
         <li>Flooding the market with one good drops its price. Process it into something worth more.</li>
         <li>Bills fall due every {FLOW_SETTLE_SEC}s.</li>
+        <li>
+          Equity is everything you own minus everything you owe. Below 0 at a bill and you’re insolvent; still below at the next bill and
+          the creditors liquidate, leaving you your cheapest Farm and Market and a Wallet with a little money.
+        </li>
       </ol>
       <h3>Prices</h3>
       <table className="price-table">

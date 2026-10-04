@@ -4,10 +4,13 @@ import {
   applyFlowCommand,
   BUFFER_CAP,
   bufferCap,
+  equity,
   FLOW_LOAN_OFFERS,
   FLOW_LOAN_TERM,
   FLOW_SETTLE_SEC,
+  licenseCost,
   MONEY,
+  NODE_RESALE_RATE,
   newFlowGame,
   nodeUpkeep,
   salePrice,
@@ -36,6 +39,12 @@ const byId = (s: FlowState, id: string) => s.nodes.find((n) => n.id === id)!;
 const BUDGET0 = START_CASH - STARTER_WALLET_FUND;
 const STARTER = FLOW_LOAN_OFFERS.find((o) => o.id === 'starter')!;
 const budgetCount = (s: FlowState) => s.nodes.filter((n) => n.kind === 'budget').length;
+const last = (s: FlowState) => s.nodes[s.nodes.length - 1];
+// Buy a facility's license (and anything it needs first), then build it.
+const build = (s: FlowState, facilityType: string, x = 300, y = 0) => {
+  s = cmd(s, { kind: 'buyLicense', facilityType });
+  return cmd(s, { kind: 'buildFacility', facilityType, x, y });
+};
 
 describe('new flow game', () => {
   it('starts with a farm, a market, a funded wallet, the budget and no wires', () => {
@@ -104,7 +113,7 @@ describe('flow', () => {
   it('rejects wires to nodes that cannot use the good', () => {
     let s = newFlowGame(S, { seed: 1 });
     s = { ...s, cash: 10_000 };
-    s = cmd(s, { kind: 'buildFacility', facilityType: 'hop_yard', x: 0, y: 0 });
+    s = build(s, 'hop_yard', 0, 0);
     const hops = s.nodes.find((n) => n.productId === 'hops')!;
     const before = s.wires.length;
     s = cmd(s, { kind: 'connect', from: farm(s).id, to: hops.id });
@@ -128,7 +137,7 @@ describe('flow', () => {
   it('a processor consumes wired inputs and starves without them', () => {
     let s = newFlowGame(S, { seed: 1 });
     s = { ...s, cash: 10_000 };
-    s = cmd(s, { kind: 'buildFacility', facilityType: 'malthouse', x: 300, y: 0 });
+    s = build(s, 'malthouse');
     const malt = s.nodes.find((n) => n.productId === 'malt')!;
     s = run(s, 3);
     expect(s.nodes.find((n) => n.id === malt.id)!.status).toBe('starved');
@@ -258,19 +267,35 @@ describe('wallets and loans', () => {
     expect(s.cash).toBe(cash);
   });
 
-  it('a borrower sends its principal down a wire and collects installments', () => {
+  it('taking a loan pays it into the budget, and a wired budget repays it', () => {
     let s = newFlowGame(S, { seed: 1 });
     s = cmd(s, { kind: 'takeLoan', offerId: 'starter', x: 0, y: 0 });
-    const b = s.nodes[s.nodes.length - 1].id;
-    expect(byId(s, b).money).toBe(500);
-    s = cmd(s, { kind: 'connect', from: b, to: budget(s).id });
+    const b = last(s).id;
+    expect(s.cash).toBe(BUDGET0 + STARTER.principal);
+    expect(byId(s, b).money).toBe(0);
+    expect(cmd(s, { kind: 'connect', from: b, to: budget(s).id }).wires).toHaveLength(0); // nothing to send
     s = cmd(s, { kind: 'connect', from: budget(s).id, to: b });
     const cash = s.cash;
     s = run(s, FLOW_SETTLE_SEC);
-    expect(byId(s, b).money).toBe(0);
     expect(byId(s, b).loan!.balance).toBe(STARTER.totalRepay - STARTER.installmentPerCycle);
     expect(byId(s, b).loan!.arrears).toBe(0);
-    expect(s.cash).toBe(cash + 500 - STARTER.installmentPerCycle);
+    expect(s.cash).toBe(cash - STARTER.installmentPerCycle);
+  });
+
+  it('paying a loan in full clears it, arrears and all, and needs the money', () => {
+    let s = newFlowGame(S, { seed: 1 });
+    s = cmd(s, { kind: 'takeLoan', offerId: 'starter', x: 0, y: 0 });
+    const b = last(s).id;
+    s = run(s, FLOW_SETTLE_SEC); // nothing repays it: one installment falls into arrears
+    expect(byId(s, b).loan!.arrears).toBe(STARTER.installmentPerCycle);
+    const owed = byId(s, b).loan!.balance + byId(s, b).loan!.arrears;
+    expect(owed).toBe(STARTER.totalRepay);
+    const poor = cmd({ ...s, cash: owed - 1 }, { kind: 'payOffLoan', nodeId: b });
+    expect(poor.nodes.some((n) => n.id === b)).toBe(true); // refused
+    const cash = s.cash;
+    s = cmd(s, { kind: 'payOffLoan', nodeId: b });
+    expect(s.nodes.some((n) => n.id === b)).toBe(false);
+    expect(s.cash).toBe(cash - owed);
   });
 
   it('loans are repaid over twenty bills, costing what the classic game charges', () => {
@@ -296,7 +321,7 @@ describe('levels and demand', () => {
   it('an upgraded facility works in bigger batches and holds more', () => {
     let s = newFlowGame(S, { seed: 1 });
     s = { ...s, cash: 100_000 };
-    s = cmd(s, { kind: 'buildFacility', facilityType: 'malthouse', x: 300, y: 0 });
+    s = build(s, 'malthouse');
     const mh = s.nodes[s.nodes.length - 1].id;
     s = cmd(s, { kind: 'connect', from: budget(s).id, to: mh });
     s = cmd(s, { kind: 'levelUp', nodeId: mh });
@@ -345,6 +370,150 @@ describe('budget blocks', () => {
     expect(s.cash).toBe(cash - WIRE_COST + 100); // collected by any block, lands in the one balance
     for (const n of s.nodes.filter((x) => x.kind === 'budget')) s = cmd(s, { kind: 'sellNode', nodeId: n.id });
     expect(budgetCount(s)).toBe(1);
+  });
+});
+
+describe('equity and bankruptcy', () => {
+  it('equity is money, goods and resale value, less debt', () => {
+    let s = newFlowGame(S, { seed: 1 });
+    const goods = 7 * s.market.barley.price;
+    s = { ...s, nodes: s.nodes.map((n) => (n.kind === 'facility' ? { ...n, outBuf: 7 } : n.kind === 'market' ? { ...n, money: 40 } : n)) };
+    const resale = s.nodes.reduce((a, n) => a + n.invested * NODE_RESALE_RATE, 0);
+    expect(equity(s)).toBeCloseTo(BUDGET0 + STARTER_WALLET_FUND + 40 + goods + resale, 6);
+    s = cmd(s, { kind: 'takeLoan', offerId: 'starter', x: 0, y: 0 });
+    expect(equity(s)).toBeCloseTo(BUDGET0 + STARTER_WALLET_FUND + 40 + goods + resale + STARTER.principal - STARTER.totalRepay, 6);
+  });
+
+  it('one bill below zero is a warning, and recovering clears it', () => {
+    let s = newFlowGame(S, { seed: 1 });
+    s = cmd(s, { kind: 'takeLoan', offerId: 'empire', x: 0, y: 0 });
+    s = { ...s, cash: 0 };
+    s = run(s, FLOW_SETTLE_SEC);
+    expect(equity(s)).toBeLessThan(0);
+    expect(s.insolvent).toBe(true);
+    expect(s.bankruptcy).toBeNull();
+    s = { ...s, cash: 20_000 };
+    s = run(s, FLOW_SETTLE_SEC);
+    expect(s.insolvent).toBe(false);
+    expect(s.bankruptcy).toBeNull();
+  });
+
+  it('a second bill below zero liquidates, keeping the cheapest farm and market', () => {
+    let s = newFlowGame(S, { seed: 1 });
+    s = { ...s, cash: 100_000 };
+    s = build(s, 'malthouse');
+    s = cmd(s, { kind: 'buildFacility', facilityType: 'farm', x: 300, y: 300 });
+    s = cmd(s, { kind: 'buildMarket', x: 600, y: 300 });
+    const starterFarm = farm(s).id;
+    const starterMarket = market(s).id; // cost nothing, so it is the cheapest
+    s = cmd(s, { kind: 'takeLoan', offerId: 'empire', x: 0, y: 0 });
+    s = { ...s, cash: 0 };
+    s = run(s, 2 * FLOW_SETTLE_SEC);
+    expect(s.bankruptcy).not.toBeNull();
+    expect(s.bankruptcy!.sold).toEqual(['Malthouse', 'Barley Farm', 'Market']); // most valuable first
+    expect(s.bankruptcy!.forgivenG).toBeGreaterThan(0);
+    expect(s.nodes.some((n) => n.kind === 'borrower')).toBe(false);
+    expect(s.nodes.filter((n) => n.kind !== 'budget').map((n) => n.id).sort()).toEqual([starterFarm, starterMarket, wallet(s).id].sort());
+    expect(wallet(s).money).toBe(STARTER_WALLET_FUND);
+    expect(s.insolvent).toBe(false);
+    expect(equity(s)).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('distribution', () => {
+  // A farm (1.2/s, less than one wire carries) wired to two markets, both paid by the budget.
+  const twoMarkets = () => {
+    let s = newFlowGame(S, { seed: 1 });
+    s = { ...s, cash: 100_000 };
+    s = cmd(s, { kind: 'buildMarket', x: 600, y: 400 });
+    const m2 = last(s).id;
+    for (const id of [farm(s).id, market(s).id, m2]) s = cmd(s, { kind: 'connect', from: budget(s).id, to: id });
+    s = cmd(s, { kind: 'connect', from: farm(s).id, to: market(s).id });
+    s = cmd(s, { kind: 'connect', from: farm(s).id, to: m2 });
+    return s;
+  };
+  const moved = (s: FlowState, secs: number) => {
+    const tot = [0, 0];
+    for (let i = 0; i < secs; i++) {
+      s = run(s, 1);
+      s.wires.filter((w) => w.from === farm(s).id).forEach((w, k) => (tot[k] += w.movedLastSec));
+    }
+    return tot;
+  };
+
+  it('balance splits evenly; priority fills the top wire first', () => {
+    const [a, b] = moved(twoMarkets(), 40);
+    expect(Math.abs(a - b)).toBeLessThanOrEqual(1);
+    let s = twoMarkets();
+    s = cmd(s, { kind: 'setDistribution', nodeId: farm(s).id, mode: 'priority' });
+    const [top, bottom] = moved(s, 40);
+    expect(top).toBeGreaterThan(40);
+    expect(bottom).toBe(0);
+  });
+
+  it('a switched-off wire carries nothing, and moving a wire changes the order', () => {
+    let s = twoMarkets();
+    s = cmd(s, { kind: 'setDistribution', nodeId: farm(s).id, mode: 'priority' });
+    const [w1, w2] = s.wires.filter((w) => w.from === farm(s).id);
+    s = cmd(s, { kind: 'toggleWire', wireId: w1.id });
+    expect(moved(s, 20)[0]).toBe(0);
+    s = cmd(s, { kind: 'toggleWire', wireId: w1.id });
+    s = cmd(s, { kind: 'moveWire', wireId: w1.id, dir: 1 });
+    expect(s.wires.filter((w) => w.from === farm(s).id).map((w) => w.id)).toEqual([w2.id, w1.id]);
+  });
+
+  it('a switched-off payment link pays nothing', () => {
+    let s = newFlowGame(S, { seed: 1 });
+    s = cmd(s, { kind: 'connect', from: wallet(s).id, to: farm(s).id });
+    s = cmd(s, { kind: 'toggleWire', wireId: s.wires[0].id });
+    s = run(s, FLOW_SETTLE_SEC);
+    expect(farm(s).status).toBe('unpaid');
+  });
+
+  it('a short wallet pays its blocks top to bottom', () => {
+    let s = newFlowGame(S, { seed: 1 });
+    s = cmd(s, { kind: 'connect', from: wallet(s).id, to: market(s).id });
+    s = cmd(s, { kind: 'connect', from: wallet(s).id, to: farm(s).id });
+    // Enough for the wallet's own upkeep and one block, not both.
+    const own = nodeUpkeep(wallet(s), S);
+    s = { ...s, nodes: s.nodes.map((n) => (n.kind === 'wallet' ? { ...n, money: own + nodeUpkeep(market(s), S) } : n)) };
+    let t = run(s, FLOW_SETTLE_SEC);
+    expect(market(t).unpaid).toBe(0);
+    expect(farm(t).status).toBe('unpaid');
+    s = cmd(s, { kind: 'moveWire', wireId: s.wires[1].id, dir: -1 }); // farm to the top
+    s = { ...s, nodes: s.nodes.map((n) => (n.kind === 'wallet' ? { ...n, money: own + nodeUpkeep(farm(s), S) } : n)) };
+    t = run(s, FLOW_SETTLE_SEC);
+    expect(farm(t).unpaid).toBe(0);
+    expect(market(t).status).toBe('unpaid');
+  });
+});
+
+describe('licenses', () => {
+  it('a facility cannot be built until its license is bought', () => {
+    let s = newFlowGame(S, { seed: 1 });
+    s = { ...s, cash: 100_000 };
+    const count = s.nodes.length;
+    s = cmd(s, { kind: 'buildFacility', facilityType: 'hop_yard', x: 0, y: 0 });
+    expect(s.nodes.length).toBe(count);
+    const cash = s.cash;
+    s = cmd(s, { kind: 'buyLicense', facilityType: 'hop_yard' });
+    expect(s.cash).toBe(cash - licenseCost(S, 'hop_yard'));
+    s = cmd(s, { kind: 'buildFacility', facilityType: 'hop_yard', x: 0, y: 0 });
+    expect(s.nodes.length).toBe(count + 1);
+  });
+
+  it('a license needs the licenses of its inputs first, and the money', () => {
+    let s = newFlowGame(S, { seed: 1 });
+    s = { ...s, cash: 100_000 };
+    s = cmd(s, { kind: 'buyLicense', facilityType: 'brewery' }); // needs Malthouse and Hop Yard
+    expect(s.licenses).not.toContain('brewery');
+    s = cmd(s, { kind: 'buyLicense', facilityType: 'malthouse' });
+    s = cmd(s, { kind: 'buyLicense', facilityType: 'hop_yard' });
+    s = cmd({ ...s, cash: licenseCost(S, 'brewery') - 1 }, { kind: 'buyLicense', facilityType: 'brewery' });
+    expect(s.licenses).not.toContain('brewery');
+    s = cmd({ ...s, cash: licenseCost(S, 'brewery') }, { kind: 'buyLicense', facilityType: 'brewery' });
+    expect(s.licenses).toContain('brewery');
+    expect(s.cash).toBe(0);
   });
 });
 
