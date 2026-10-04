@@ -63,7 +63,6 @@ export default function App() {
                 <button onClick={() => setPick({ scenario: s, sandbox: false, flow: true })}>
                   Owe &amp; Flow<span className="mode-pill">new</span>
                 </button>
-                <button onClick={() => setPick({ scenario: s, sandbox: true, flow: true })}>Flow sandbox</button>
               </div>
             </div>
           ))}
@@ -73,7 +72,7 @@ export default function App() {
     );
   }
 
-  if (pick.flow) return <FlowGame key={pick.scenario.id + pick.sandbox} scenario={pick.scenario} sandbox={pick.sandbox} onExit={() => setPick(null)} />;
+  if (pick.flow) return <FlowGame key={pick.scenario.id} scenario={pick.scenario} onExit={() => setPick(null)} />;
 
   return <Game key={pick.scenario.id + pick.sandbox} scenario={pick.scenario} sandbox={pick.sandbox} onExit={() => setPick(null)} />;
 }

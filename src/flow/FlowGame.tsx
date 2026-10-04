@@ -1,28 +1,36 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import './flow.css';
 import { LOAN_OFFERS, type ScenarioConfig } from '../engine/sim';
 import {
-  accepts,
   applyFlowCommand,
   BUFFER_CAP,
   canConnect,
+  connectRule,
   debt,
-  facilityDef,
   FLOW_SETTLE_SEC,
+  hasArrears,
+  inputRows,
+  isPayLink,
+  isUpgradable,
   levelUpCost,
   MARKET_COST,
+  MONEY,
   moveNode,
-  netWorth,
   newFlowGame,
   nodeInputs,
+  nodeName,
   nodeRate,
   nodeUpkeep,
   NODE_RESALE_RATE,
+  outputOf,
+  payersOf,
   product,
   salePrice,
   SUPPLIER_COST,
   SUPPLIER_MARKUP,
   tickFlow,
+  walletReserve,
+  WALLET_COST,
   wireCapacity,
   wireUpgradeCost,
   WIRE_COST,
@@ -38,6 +46,11 @@ const HEADER = 34;
 const ROW = 24;
 const CANVAS_W = 2400;
 const CANVAS_H = 1600;
+const ZOOM_MIN = 0.4;
+const ZOOM_MAX = 2;
+const ZOOM_STEP = 1.2;
+const NODE_H_EST = 110; // a node card's rough height, for fitting the view around nodes
+const MONEY_COLOR = '#f2d16b';
 const PRODUCT_COLORS = ['#e8a33d', '#8fbf6f', '#6fb0d6', '#d68a6f', '#c79be0', '#e0d36f', '#6fd6c0', '#e06c9b'];
 
 const fmt = (n: number) => Math.round(n).toLocaleString();
@@ -46,8 +59,8 @@ const mmss = (sec: number) => `${Math.floor(sec / 60)}:${String(sec % 60).padSta
 type Selection = { kind: 'node'; id: string } | { kind: 'wire'; id: string } | null;
 type Drag = { kind: 'move'; nodeId: string; dx: number; dy: number } | { kind: 'wire'; from: string } | null;
 
-export function FlowGame({ scenario, sandbox, onExit }: { scenario: ScenarioConfig; sandbox: boolean; onExit: () => void }) {
-  const [state, setState] = useState<FlowState>(() => newFlowGame(scenario, { seed: SEED, sandbox }));
+export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExit: () => void }) {
+  const [state, setState] = useState<FlowState>(() => newFlowGame(scenario, { seed: SEED }));
   const [speed, setSpeed] = useState(1);
   const [paused, setPaused] = useState(false);
   const [selection, setSelection] = useState<Selection>(null);
@@ -55,8 +68,16 @@ export function FlowGame({ scenario, sandbox, onExit }: { scenario: ScenarioConf
   const [cursor, setCursor] = useState({ x: 0, y: 0 });
   const [toast, setToast] = useState<string | null>(null);
   const [supplierProduct, setSupplierProduct] = useState(scenario.products[0].id);
+  const [walletFund, setWalletFund] = useState(100);
+  const [zoom, setZoom] = useState(1);
+  const [infoOpen, setInfoOpen] = useState(true);
+  const [buildOpen, setBuildOpen] = useState(true);
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  // Scroll position to apply once a zoom change has resized the canvas.
+  const pendingScroll = useRef<{ left: number; top: number } | null>(null);
 
   // Real-time clock.
   useEffect(() => {
@@ -73,11 +94,13 @@ export function FlowGame({ scenario, sandbox, onExit }: { scenario: ScenarioConf
 
   const cmd = (c: FlowCommand) => setState((s) => applyFlowCommand(s, c, scenario));
 
-  const colorOf = (productId: string) => PRODUCT_COLORS[scenario.products.findIndex((p) => p.id === productId) % PRODUCT_COLORS.length];
+  const colorOf = (productId: string) =>
+    productId === MONEY ? MONEY_COLOR : PRODUCT_COLORS[scenario.products.findIndex((p) => p.id === productId) % PRODUCT_COLORS.length];
 
+  // Client pixels → canvas units. The canvas is scaled from its top-left corner, so only the scale needs undoing.
   const toCanvas = (clientX: number, clientY: number) => {
     const r = canvasRef.current!.getBoundingClientRect();
-    return { x: clientX - r.left, y: clientY - r.top };
+    return { x: (clientX - r.left) / zoom, y: (clientY - r.top) / zoom };
   };
 
   // Drop new nodes near the middle of what the player is looking at.
@@ -85,10 +108,71 @@ export function FlowGame({ scenario, sandbox, onExit }: { scenario: ScenarioConf
     const w = wrapRef.current!;
     const jitter = () => Math.round((Math.random() - 0.5) * 120);
     return {
-      x: Math.max(10, Math.round(w.scrollLeft + w.clientWidth / 2 - NODE_W / 2 + jitter())),
-      y: Math.max(10, Math.round(w.scrollTop + w.clientHeight / 2 - 60 + jitter())),
+      x: Math.max(10, Math.round((w.scrollLeft + w.clientWidth / 2) / zoom - NODE_W / 2 + jitter())),
+      y: Math.max(10, Math.round((w.scrollTop + w.clientHeight / 2) / zoom - 60 + jitter())),
     };
   };
+
+  // Zoom keeping the canvas point under (clientX, clientY) fixed; defaults to the view's centre.
+  const zoomTo = (next: number, clientX?: number, clientY?: number) => {
+    const w = wrapRef.current;
+    if (!w) return;
+    const z = zoomRef.current;
+    const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, next));
+    if (clamped === z) return;
+    const r = w.getBoundingClientRect();
+    const mx = clientX === undefined ? w.clientWidth / 2 : clientX - r.left;
+    const my = clientY === undefined ? w.clientHeight / 2 : clientY - r.top;
+    pendingScroll.current = {
+      left: ((w.scrollLeft + mx) / z) * clamped - mx,
+      top: ((w.scrollTop + my) / z) * clamped - my,
+    };
+    zoomRef.current = clamped;
+    setZoom(clamped);
+  };
+
+  // Zoom and scroll so every node is in view.
+  const fitView = () => {
+    const w = wrapRef.current;
+    if (!w || state.nodes.length === 0) return;
+    const pad = 40;
+    const minX = Math.min(...state.nodes.map((n) => n.x)) - pad;
+    const minY = Math.min(...state.nodes.map((n) => n.y)) - pad;
+    const maxX = Math.max(...state.nodes.map((n) => n.x + NODE_W)) + pad;
+    const maxY = Math.max(...state.nodes.map((n) => n.y + NODE_H_EST)) + pad;
+    const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.min(w.clientWidth / (maxX - minX), w.clientHeight / (maxY - minY))));
+    pendingScroll.current = {
+      left: ((minX + maxX) / 2) * next - w.clientWidth / 2,
+      top: ((minY + maxY) / 2) * next - w.clientHeight / 2,
+    };
+    zoomRef.current = next;
+    setZoom(next);
+    if (next === zoom) applyPendingScroll();
+  };
+
+  const applyPendingScroll = () => {
+    const w = wrapRef.current;
+    if (!w || !pendingScroll.current) return;
+    w.scrollLeft = pendingScroll.current.left;
+    w.scrollTop = pendingScroll.current.top;
+    pendingScroll.current = null;
+  };
+
+  useLayoutEffect(applyPendingScroll, [zoom]);
+
+  // Ctrl/⌘ + wheel (and trackpad pinch, which browsers report as ctrl + wheel) zooms; a plain wheel still pans.
+  useEffect(() => {
+    const w = wrapRef.current;
+    if (!w) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      zoomTo(zoomRef.current * Math.exp(-e.deltaY * 0.01), e.clientX, e.clientY);
+    };
+    w.addEventListener('wheel', onWheel, { passive: false });
+    return () => w.removeEventListener('wheel', onWheel);
+    // zoomTo reads only refs, so binding it once is safe.
+  }, []);
 
   // Pointer tracking for dragging nodes and drawing wires.
   useEffect(() => {
@@ -122,8 +206,6 @@ export function FlowGame({ scenario, sandbox, onExit }: { scenario: ScenarioConf
   });
 
   const nodeById = new Map(state.nodes.map((n) => [n.id, n]));
-  const nw = netWorth(state, scenario);
-  const goal = state.goal;
   const dragFrom = drag?.kind === 'wire' ? nodeById.get(drag.from) : undefined;
   const selectedNode = selection?.kind === 'node' ? nodeById.get(selection.id) : undefined;
   const selectedWire = selection?.kind === 'wire' ? state.wires.find((w) => w.id === selection.id) : undefined;
@@ -137,32 +219,20 @@ export function FlowGame({ scenario, sandbox, onExit }: { scenario: ScenarioConf
           <span className="scenario-tag">{scenario.name}</span>
         </div>
         <div className="flow-cash">
-          <span className="stat-label">Cash</span>
+          <span className="stat-label">Budget</span>
           <span className={'cash-value' + (state.cash < 0 ? ' negative' : '')}>{fmt(state.cash)}g</span>
         </div>
         <div className="stat">
           <span className="stat-label">Selling</span>
           <span className="stat-value up">+{fmt(salesPerSec)}g/s</span>
         </div>
-        <div className="goal-block">
-          <div className="goal-row">
-            <span className="nw-label">Net worth</span>
-            <span className="nw-value">{fmt(nw)}g</span>
-            {goal && <span className="goal-target">/ {fmt(goal.targetNetWorth)}g</span>}
-          </div>
-          {goal && (
-            <div className="goal-bar">
-              <div className="goal-fill" style={{ width: `${Math.max(0, Math.min(100, (nw / goal.targetNetWorth) * 100))}%` }} />
-            </div>
-          )}
-        </div>
         <div className="stat">
-          <span className="stat-label">{goal ? 'Time left' : 'Clock'}</span>
-          <span className="stat-value">{goal ? mmss(Math.max(0, goal.timeLimitSec - state.clockSec)) : mmss(state.clockSec)}</span>
+          <span className="stat-label">Clock</span>
+          <span className="stat-value">{mmss(state.clockSec)}</span>
         </div>
         <div className="stat">
           <span className="stat-label">Bills in</span>
-          <span className="stat-value">{FLOW_SETTLE_SEC - (state.clockSec % FLOW_SETTLE_SEC)}s</span>
+          <BillPie elapsed={state.clockSec % FLOW_SETTLE_SEC} speed={paused ? 0 : speed} />
         </div>
         <div className="clock-controls">
           <button className="pause" onClick={() => setPaused((p) => !p)}>{paused ? '▶' : '❚❚'}</button>
@@ -171,182 +241,249 @@ export function FlowGame({ scenario, sandbox, onExit }: { scenario: ScenarioConf
               {x}×
             </button>
           ))}
+          <button className={'flow-toggle' + (buildOpen ? ' active' : '')} aria-pressed={buildOpen} onClick={() => setBuildOpen((o) => !o)}>
+            Build
+          </button>
+          <button className={'flow-toggle' + (infoOpen ? ' active' : '')} aria-pressed={infoOpen} onClick={() => setInfoOpen((o) => !o)}>
+            Info
+          </button>
           <button onClick={onExit}>Exit</button>
         </div>
       </header>
 
       <div className="flow-main">
-        <aside className="flow-panel flow-palette">
-          <h3>Build</h3>
-          {scenario.facilityTypes.map((def) => {
-            const p = product(scenario, def.productId);
-            return (
+        {buildOpen && (
+          <aside className="flow-panel flow-palette">
+            <InspectorHead title="Build" onClose={() => setBuildOpen(false)} />
+            {scenario.facilityTypes.map((def) => {
+              const p = product(scenario, def.productId);
+              return (
+                <button
+                  key={def.type}
+                  className="palette-item"
+                  disabled={state.cash < def.buildCost}
+                  onClick={() => cmd({ kind: 'buildFacility', facilityType: def.type, ...spawnPoint() })}
+                >
+                  <span className="palette-top">
+                    <span className="swatch" style={{ background: colorOf(p.id) }} />
+                    <b>{def.name}</b>
+                    <span className="cost">{fmt(def.buildCost)}g</span>
+                  </span>
+                  <span className="palette-sub">
+                    {p.inputs.length ? p.inputs.map((i) => `${i.qty} ${product(scenario, i.id).name}`).join(' + ') + ' → ' : ''}
+                    {p.name} · {def.baseRatePerSec}/s
+                  </span>
+                </button>
+              );
+            })}
+            <button className="palette-item" disabled={state.cash < MARKET_COST} onClick={() => cmd({ kind: 'buildMarket', ...spawnPoint() })}>
+              <span className="palette-top">
+                <span className="swatch market" />
+                <b>Market stall</b>
+                <span className="cost">{MARKET_COST}g</span>
+              </span>
+              <span className="palette-sub">Another place to sell. Same prices, same glut.</span>
+            </button>
+            <div className="palette-item supplier-row">
+              <span className="palette-top">
+                <span className="swatch supplier" />
+                <b>Supplier</b>
+                <span className="cost">{SUPPLIER_COST}g</span>
+              </span>
+              <span className="palette-sub">Buys a good at {Math.round((SUPPLIER_MARKUP - 1) * 100)}% over spot and feeds it in.</span>
+              <div className="supplier-controls">
+                <select value={supplierProduct} onChange={(e) => setSupplierProduct(e.target.value)}>
+                  {scenario.products.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+                <button disabled={state.cash < SUPPLIER_COST} onClick={() => cmd({ kind: 'buildSupplier', productId: supplierProduct, ...spawnPoint() })}>
+                  Sign
+                </button>
+              </div>
+            </div>
+
+            <div className="palette-item supplier-row">
+              <span className="palette-top">
+                <span className="swatch wallet" />
+                <b>Wallet</b>
+                <span className="cost">{WALLET_COST}g</span>
+              </span>
+              <span className="palette-sub">Holds money and pays the upkeep of every block you wire it into.</span>
+              <label className="fund-label">
+                Fund from Budget
+                <input
+                  type="number"
+                  min={0}
+                  step={50}
+                  value={walletFund}
+                  onChange={(e) => setWalletFund(Math.max(0, Math.round(Number(e.target.value)) || 0))}
+                />
+                g
+              </label>
               <button
-                key={def.type}
-                className="palette-item"
-                disabled={state.cash < def.buildCost}
-                onClick={() => cmd({ kind: 'buildFacility', facilityType: def.type, ...spawnPoint() })}
+                disabled={state.cash < WALLET_COST + walletFund}
+                onClick={() => cmd({ kind: 'buildWallet', fund: walletFund, ...spawnPoint() })}
               >
-                <span className="palette-top">
-                  <span className="swatch" style={{ background: colorOf(p.id) }} />
-                  <b>{def.name}</b>
-                  <span className="cost">{fmt(def.buildCost)}g</span>
-                </span>
-                <span className="palette-sub">
-                  {p.inputs.length ? p.inputs.map((i) => `${i.qty} ${product(scenario, i.id).name}`).join(' + ') + ' → ' : ''}
-                  {p.name} · {def.baseRatePerSec}/s
-                </span>
-              </button>
-            );
-          })}
-          <button className="palette-item" disabled={state.cash < MARKET_COST} onClick={() => cmd({ kind: 'buildMarket', ...spawnPoint() })}>
-            <span className="palette-top">
-              <span className="swatch market" />
-              <b>Market stall</b>
-              <span className="cost">{MARKET_COST}g</span>
-            </span>
-            <span className="palette-sub">Another place to sell. Same prices, same glut.</span>
-          </button>
-          <div className="palette-item supplier-row">
-            <span className="palette-top">
-              <span className="swatch supplier" />
-              <b>Supplier</b>
-              <span className="cost">{SUPPLIER_COST}g</span>
-            </span>
-            <span className="palette-sub">Buys a good at {Math.round((SUPPLIER_MARKUP - 1) * 100)}% over spot and feeds it in.</span>
-            <div className="supplier-controls">
-              <select value={supplierProduct} onChange={(e) => setSupplierProduct(e.target.value)}>
-                {scenario.products.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-              <button disabled={state.cash < SUPPLIER_COST} onClick={() => cmd({ kind: 'buildSupplier', productId: supplierProduct, ...spawnPoint() })}>
-                Sign
+                Open · {fmt(WALLET_COST + walletFund)}g from Budget
               </button>
             </div>
-          </div>
+
+            <button className="palette-item" onClick={() => cmd({ kind: 'buildBudget', ...spawnPoint() })}>
+            <span className="palette-top">
+              <span className="swatch budget" />
+              <b>Budget</b>
+              <span className="cost">free</span>
+            </span>
+            <span className="palette-sub">Another Budget block. Every one shows the same global cash, so place them wherever wires need one.</span>
+          </button>
 
           <h3>Borrow</h3>
-          {LOAN_OFFERS.map((o) => (
-            <button key={o.id} className="palette-item" disabled={state.arrears > 0} onClick={() => cmd({ kind: 'takeLoan', offerId: o.id })}>
-              <span className="palette-top">
-                <b>{o.label}</b>
-                <span className="cost up">+{fmt(o.principal)}g</span>
-              </span>
-              <span className="palette-sub">
-                {o.installmentPerCycle}g every bill × {o.termCycles} = {fmt(o.totalRepay)}g
-              </span>
-            </button>
-          ))}
-          {debt(state) > 0 && (
-            <div className="debt-line">
-              Owed: <b>{fmt(debt(state))}g</b>
-              {state.arrears > 0 && (
-                <>
-                  {' '}
-                  · arrears {fmt(state.arrears)}g <button onClick={() => cmd({ kind: 'payArrears' })}>Pay</button>
-                </>
-              )}
-            </div>
-          )}
-        </aside>
-
-        <div className="flow-canvas-wrap" ref={wrapRef}>
-          <div
-            className={'flow-canvas' + (drag?.kind === 'wire' ? ' wiring' : '')}
-            ref={canvasRef}
-            style={{ width: CANVAS_W, height: CANVAS_H }}
-            onPointerDown={(e) => {
-              if (e.target === canvasRef.current || (e.target as Element).tagName === 'svg') setSelection(null);
-            }}
-          >
-            <svg className="flow-wires" width={CANVAS_W} height={CANVAS_H}>
-              {state.wires.map((w) => {
-                const from = nodeById.get(w.from);
-                const to = nodeById.get(w.to);
-                if (!from || !to) return null;
-                const a = outPort(from);
-                const b = inPort(to, w.productId, scenario);
-                return (
-                  <WirePath
-                    key={w.id}
-                    wire={w}
-                    a={a}
-                    b={b}
-                    color={colorOf(w.productId)}
-                    selected={selection?.kind === 'wire' && selection.id === w.id}
-                    onSelect={() => setSelection({ kind: 'wire', id: w.id })}
-                  />
-                );
-              })}
-              {dragFrom && (
-                <path className="wire-pending" d={curve(outPort(dragFrom), cursor)} stroke={colorOf(dragFrom.productId!)} />
-              )}
-            </svg>
-
-            {state.nodes.map((n) => (
-              <NodeCard
-                key={n.id}
-                node={n}
-                scenario={scenario}
-                colorOf={colorOf}
-                selected={selection?.kind === 'node' && selection.id === n.id}
-                dropTarget={dragFrom ? (n.id !== dragFrom.id && accepts(n, dragFrom.productId!, scenario) ? 'ok' : 'no') : null}
-                onHeaderDown={(e) => {
-                  const p = toCanvas(e.clientX, e.clientY);
-                  setSelection({ kind: 'node', id: n.id });
-                  setDrag({ kind: 'move', nodeId: n.id, dx: p.x - n.x, dy: p.y - n.y });
-                }}
-                onPortDown={(e) => {
-                  e.stopPropagation();
-                  setCursor(toCanvas(e.clientX, e.clientY));
-                  setDrag({ kind: 'wire', from: n.id });
-                }}
-                onSelect={() => setSelection({ kind: 'node', id: n.id })}
-              />
+            {LOAN_OFFERS.map((o) => (
+              <button key={o.id} className="palette-item" disabled={hasArrears(state)} onClick={() => cmd({ kind: 'takeLoan', offerId: o.id, ...spawnPoint() })}>
+                <span className="palette-top">
+                  <b>{o.label}</b>
+                  <span className="cost up">+{fmt(o.principal)}g</span>
+                </span>
+                <span className="palette-sub">
+                  {o.installmentPerCycle}g every bill × {o.termCycles} = {fmt(o.totalRepay)}g
+                </span>
+              </button>
             ))}
+            {debt(state) > 0 && (
+              <div className="debt-line">
+                Owed: <b>{fmt(debt(state))}g</b>
+                {hasArrears(state) && ' · in arrears, so no new loans. Open the Borrower to pay.'}
+              </div>
+            )}
+          </aside>
+        )}
+
+        <div className="flow-canvas-area">
+          <div className="flow-canvas-wrap" ref={wrapRef}>
+            <div className="flow-canvas-sizer" style={{ width: CANVAS_W * zoom, height: CANVAS_H * zoom }}>
+              <div
+                className={'flow-canvas' + (drag?.kind === 'wire' ? ' wiring' : '')}
+                ref={canvasRef}
+                style={{ width: CANVAS_W, height: CANVAS_H, transform: `scale(${zoom})` }}
+                onPointerDown={(e) => {
+                  if (e.target === canvasRef.current || (e.target as Element).tagName === 'svg') setSelection(null);
+                }}
+              >
+                <svg className="flow-wires" width={CANVAS_W} height={CANVAS_H}>
+                  {state.wires.map((w) => {
+                    const from = nodeById.get(w.from);
+                    const to = nodeById.get(w.to);
+                    if (!from || !to) return null;
+                    const a = outPort(from);
+                    const b = inPort(to, w.productId, scenario);
+                    return (
+                      <WirePath
+                        key={w.id}
+                        wire={w}
+                        pay={isPayLink(state, w)}
+                        a={a}
+                        b={b}
+                        color={colorOf(w.productId)}
+                        selected={selection?.kind === 'wire' && selection.id === w.id}
+                        onSelect={() => setSelection({ kind: 'wire', id: w.id })}
+                      />
+                    );
+                  })}
+                  {dragFrom && (
+                    <path className="wire-pending" d={curve(outPort(dragFrom), cursor)} stroke={colorOf(outputOf(dragFrom)!)} />
+                  )}
+                </svg>
+
+                {state.nodes.map((n) => (
+                  <NodeCard
+                    key={n.id}
+                    node={n}
+                    state={state}
+                    scenario={scenario}
+                    colorOf={colorOf}
+                    selected={selection?.kind === 'node' && selection.id === n.id}
+                    dropTarget={dragFrom ? (connectRule(dragFrom, n, scenario) === null ? 'ok' : 'no') : null}
+                    onHeaderDown={(e) => {
+                      const p = toCanvas(e.clientX, e.clientY);
+                      setSelection({ kind: 'node', id: n.id });
+                      setDrag({ kind: 'move', nodeId: n.id, dx: p.x - n.x, dy: p.y - n.y });
+                    }}
+                    onPortDown={(e) => {
+                      e.stopPropagation();
+                      setCursor(toCanvas(e.clientX, e.clientY));
+                      setDrag({ kind: 'wire', from: n.id });
+                    }}
+                    onSelect={() => setSelection({ kind: 'node', id: n.id })}
+                  />
+                ))}
+              </div>
+            </div>
+            {toast && <div className="flow-toast">{toast}</div>}
           </div>
-          {toast && <div className="flow-toast">{toast}</div>}
+          <div className="flow-zoom" role="group" aria-label="Zoom">
+            <button onClick={() => zoomTo(zoomRef.current / ZOOM_STEP)} disabled={zoom <= ZOOM_MIN} aria-label="Zoom out">
+              −
+            </button>
+            <button className="flow-zoom-level" onClick={() => zoomTo(1)} title="Reset to 100%">
+              {Math.round(zoom * 100)}%
+            </button>
+            <button onClick={() => zoomTo(zoomRef.current * ZOOM_STEP)} disabled={zoom >= ZOOM_MAX} aria-label="Zoom in">
+              +
+            </button>
+            <button onClick={fitView}>Fit</button>
+          </div>
         </div>
 
-        <aside className="flow-panel flow-inspector">
-          {selectedNode ? (
+        {selectedNode ? (
+          <aside className="flow-panel flow-inspector">
             <NodeInspector node={selectedNode} state={state} scenario={scenario} cmd={cmd} onClose={() => setSelection(null)} />
-          ) : selectedWire ? (
+          </aside>
+        ) : selectedWire ? (
+          <aside className="flow-panel flow-inspector">
             <WireInspector wire={selectedWire} state={state} scenario={scenario} cmd={cmd} onClose={() => setSelection(null)} />
-          ) : (
-            <Overview state={state} scenario={scenario} />
-          )}
-        </aside>
+          </aside>
+        ) : (
+          infoOpen && (
+            <aside className="flow-panel flow-inspector">
+              <Overview state={state} scenario={scenario} onClose={() => setInfoOpen(false)} />
+            </aside>
+          )
+        )}
       </div>
 
-      {state.outcome && (
-        <div className="report-overlay">
-          <div className="report-card flow-end">
-            <h2>{state.outcome === 'won' ? 'Your factory paid off!' : "Time's up"}</h2>
-            <p>
-              {state.outcome === 'won'
-                ? `You reached ${fmt(goal!.targetNetWorth)}g net worth in ${mmss(state.wonAtSec!)}.`
-                : `You finished at ${fmt(nw)}g net worth.`}
-            </p>
-            <ul>
-              <li>Sold: {fmt(state.totals.salesG)}g</li>
-              <li>Upkeep paid: {fmt(state.totals.upkeepG)}g</li>
-              <li>Bought from suppliers: {fmt(state.totals.suppliesG)}g</li>
-              <li>Loan payments: {fmt(state.totals.loanPaidG)}g</li>
-            </ul>
-            <div className="scenario-actions">
-              <button className="primary" onClick={() => setState(newFlowGame(scenario, { seed: SEED + state.clockSec, sandbox }))}>
-                Play again
-              </button>
-              <button onClick={onExit}>Back to menu</button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
+  );
+}
+
+// A pie that fills up as the next bill approaches, turning red in the last few seconds.
+function BillPie({ elapsed, speed }: { elapsed: number; speed: number }) {
+  const left = FLOW_SETTLE_SEC - elapsed;
+  // The wedge is a stroke as wide as its own diameter, so it fills a disc of radius 2r.
+  // Keep that disc (11) inside the outline (12) and the outline inside the 28px box.
+  const r = 5.5;
+  const circ = 2 * Math.PI * r;
+  // Ease toward the next second at game speed; snap back (no transition) when a bill resets it.
+  const transition = elapsed === 0 || speed === 0 ? 'none' : `stroke-dashoffset ${1 / speed}s linear`;
+  return (
+    <span className={'bill-pie' + (left <= 5 ? ' due' : '')} role="img" aria-label={`Bills in ${left} seconds`} title={`Bills in ${left}s`}>
+      <svg width={28} height={28} viewBox="0 0 28 28">
+        <circle className="bill-pie-track" cx={14} cy={14} r={12} />
+        <circle
+          className="bill-pie-fill"
+          cx={14}
+          cy={14}
+          r={r}
+          strokeWidth={r * 2}
+          strokeDasharray={circ}
+          strokeDashoffset={circ * (1 - elapsed / FLOW_SETTLE_SEC)}
+          style={{ transition }}
+          transform="rotate(-90 14 14)"
+        />
+      </svg>
+    </span>
   );
 }
 
@@ -357,7 +494,7 @@ export function FlowGame({ scenario, sandbox, onExit }: { scenario: ScenarioConf
 type Pt = { x: number; y: number };
 
 function portRows(node: FlowNode, scenario: ScenarioConfig) {
-  return Math.max(1, nodeInputs(node, scenario).length);
+  return Math.max(1, inputRows(node, scenario).length);
 }
 
 function outPort(n: FlowNode): Pt {
@@ -365,7 +502,9 @@ function outPort(n: FlowNode): Pt {
 }
 
 function inPort(n: FlowNode, productId: string, scenario: ScenarioConfig): Pt {
-  const idx = Math.max(0, nodeInputs(n, scenario).findIndex((i) => i.id === productId));
+  const rows = inputRows(n, scenario);
+  let idx = rows.indexOf(productId);
+  if (idx < 0) idx = Math.max(0, rows.indexOf('*goods'));
   return { x: n.x, y: n.y + HEADER + ROW * idx + ROW / 2 };
 }
 
@@ -378,22 +517,44 @@ function curve(a: Pt, b: Pt) {
 // Pieces
 // ---------------------------------------------------------------------------
 
-function WirePath({ wire, a, b, color, selected, onSelect }: { wire: Wire; a: Pt; b: Pt; color: string; selected: boolean; onSelect: () => void }) {
+function WirePath({
+  wire,
+  pay,
+  a,
+  b,
+  color,
+  selected,
+  onSelect,
+}: {
+  wire: Wire;
+  pay: boolean;
+  a: Pt;
+  b: Pt;
+  color: string;
+  selected: boolean;
+  onSelect: () => void;
+}) {
   const d = curve(a, b);
   const cap = wireCapacity(wire);
-  const load = wire.movedLastSec / cap;
+  const money = wire.productId === MONEY;
+  const load = pay ? 0 : wire.movedLastSec / cap;
   // Dots travel faster the more the wire carries.
   const dur = wire.movedLastSec > 0 ? Math.max(0.35, 1.6 - load * 1.2) : 0;
   const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  const label = pay ? 'pays' : money ? `${Math.round(wire.movedLastSec)}/${cap}g` : `${wire.movedLastSec}/${cap}`;
+  const labelW = Math.max(44, label.length * 6.5 + 12);
   return (
-    <g className={'wire' + (selected ? ' selected' : '') + (load >= 1 ? ' maxed' : '')} onPointerDown={(e) => (e.stopPropagation(), onSelect())}>
+    <g
+      className={'wire' + (selected ? ' selected' : '') + (load >= 1 ? ' maxed' : '') + (pay ? ' pay' : '')}
+      onPointerDown={(e) => (e.stopPropagation(), onSelect())}
+    >
       <path className="wire-hit" d={d} />
       <path className="wire-base" d={d} stroke={color} strokeWidth={2 + wire.level} />
       {dur > 0 && <path className="wire-flow" d={d} stroke={color} strokeWidth={2 + wire.level} style={{ animationDuration: `${dur}s` }} />}
       <g transform={`translate(${mid.x}, ${mid.y})`}>
-        <rect className="wire-label-bg" x={-22} y={-9} width={44} height={18} rx={9} />
+        <rect className="wire-label-bg" x={-labelW / 2} y={-9} width={labelW} height={18} rx={9} />
         <text className="wire-label" textAnchor="middle" dy={4}>
-          {wire.movedLastSec}/{cap}
+          {label}
         </text>
       </g>
     </g>
@@ -405,10 +566,12 @@ const STATUS_TEXT: Record<string, string> = {
   running: 'running',
   starved: 'needs input',
   blocked: 'backed up',
+  unpaid: 'unpaid · stopped',
 };
 
 function NodeCard({
   node,
+  state,
   scenario,
   colorOf,
   selected,
@@ -418,6 +581,7 @@ function NodeCard({
   onSelect,
 }: {
   node: FlowNode;
+  state: FlowState;
   scenario: ScenarioConfig;
   colorOf: (id: string) => string;
   selected: boolean;
@@ -426,15 +590,82 @@ function NodeCard({
   onPortDown: (e: React.PointerEvent) => void;
   onSelect: () => void;
 }) {
+  const rows = inputRows(node, scenario);
   const inputs = nodeInputs(node, scenario);
-  const rows = portRows(node, scenario);
-  const title =
-    node.kind === 'facility'
-      ? facilityDef(scenario, node.facilityType!).name
-      : node.kind === 'market'
-        ? 'Market'
-        : `${product(scenario, node.productId!).name} Supplier`;
-  const out = node.productId ? product(scenario, node.productId) : null;
+  const out = outputOf(node)!;
+  const upkeep = nodeUpkeep(node, scenario);
+
+  const inLabel = (id: string) => {
+    if (id === '*goods') return <span className="port-label">sells anything</span>;
+    if (id !== MONEY) {
+      const inp = inputs.find((i) => i.id === id)!;
+      return (
+        <span className="port-label">
+          {inp.qty}× {product(scenario, id).name}
+          <span className="buf">{node.inBuf[id] ?? 0}</span>
+        </span>
+      );
+    }
+    if (node.kind === 'budget' || node.kind === 'wallet') return <span className="port-label">in</span>;
+    if (node.kind === 'borrower') return <span className="port-label">repays {node.loan!.installmentPerCycle}g</span>;
+    return (
+      <span className="port-label">
+        upkeep {upkeep}g{node.unpaid > 0 && <span className="owed">owes {fmt(node.unpaid)}g</span>}
+      </span>
+    );
+  };
+
+  const outLabel =
+    out !== MONEY ? (
+      <>
+        <span className="buf">{node.outBuf}</span>
+        {product(scenario, out).name}
+      </>
+    ) : (
+      <span className="money">{fmt(node.kind === 'budget' ? state.cash : node.money)}g</span>
+    );
+
+  const foot = (() => {
+    if (node.kind === 'facility' || node.kind === 'supplier')
+      return (
+        <>
+          <span className="status-dot" />
+          <span>{STATUS_TEXT[node.status]}</span>
+          <span className="foot-rate">{+nodeRate(node, scenario).toFixed(2)}/s</span>
+        </>
+      );
+    if (node.kind === 'market')
+      return (
+        <>
+          <span className="status-dot" />
+          <span>{node.status === 'unpaid' ? STATUS_TEXT.unpaid : `+${fmt(node.soldLastSec)}g/s`}</span>
+        </>
+      );
+    if (node.kind === 'wallet')
+      return (
+        <>
+          <span className="status-dot" />
+          <span>{node.status === 'unpaid' ? STATUS_TEXT.unpaid : `keeps ${fmt(walletReserve(state, node, scenario))}g`}</span>
+          <span className="foot-rate">upkeep {upkeep}g</span>
+        </>
+      );
+    if (node.kind === 'budget')
+      return (
+        <>
+          <span>global cash</span>
+          <span className="foot-rate">no upkeep</span>
+        </>
+      );
+    const l = node.loan!;
+    return (
+      <>
+        <span>owes {fmt(l.balance + l.arrears)}g</span>
+        {l.arrears > 0 && <span className="owed">arrears {fmt(l.arrears)}g</span>}
+        <span className="foot-rate">no upkeep</span>
+      </>
+    );
+  })();
+
   return (
     <div
       className={`flow-node kind-${node.kind} status-${node.status}` + (selected ? ' selected' : '') + (dropTarget ? ` drop-${dropTarget}` : '')}
@@ -443,90 +674,88 @@ function NodeCard({
       onPointerDown={onSelect}
     >
       <div className="node-head" style={{ height: HEADER }} onPointerDown={onHeaderDown}>
-        <span className="node-title">{title}</span>
-        {node.kind !== 'market' && <span className="node-level">L{node.level}</span>}
+        <span className="node-title">{nodeName(node, scenario)}</span>
+        {isUpgradable(node) && <span className="node-level">L{node.level}</span>}
       </div>
-      <div className="node-ports" style={{ height: ROW * rows }}>
-        {node.kind === 'market' ? (
-          <div className="port-row" style={{ height: ROW }}>
-            <span className="port in" />
-            <span className="port-label">sells anything</span>
+      <div className="node-ports" style={{ height: ROW * portRows(node, scenario) }}>
+        {rows.map((id, i) => (
+          <div key={id} className="port-row" style={{ height: ROW }}>
+            <span className={'port in' + (id === MONEY ? ' money' : '')} style={id === MONEY || id === '*goods' ? undefined : { borderColor: colorOf(id) }} />
+            {inLabel(id)}
+            {i === 0 && (
+              <>
+                <span className="port-label out-label">{outLabel}</span>
+                <span className="port out" style={{ background: colorOf(out) }} onPointerDown={onPortDown} title="Drag to connect" />
+              </>
+            )}
           </div>
-        ) : (
-          Array.from({ length: rows }, (_, i) => {
-            const inp = inputs[i];
-            return (
-              <div key={i} className="port-row" style={{ height: ROW }}>
-                {inp ? (
-                  <>
-                    <span className="port in" style={{ borderColor: colorOf(inp.id) }} />
-                    <span className="port-label">
-                      {inp.qty}× {product(scenario, inp.id).name}
-                      <span className="buf">{node.inBuf[inp.id] ?? 0}</span>
-                    </span>
-                  </>
-                ) : (
-                  <span className="port-label" />
-                )}
-                {i === 0 && out && (
-                  <>
-                    <span className="port-label out-label">
-                      <span className="buf">{node.outBuf}</span>
-                      {out.name}
-                    </span>
-                    <span className="port out" style={{ background: colorOf(out.id) }} onPointerDown={onPortDown} title="Drag to connect" />
-                  </>
-                )}
-              </div>
-            );
-          })
-        )}
+        ))}
       </div>
-      <div className="node-foot">
-        {node.kind === 'market' ? (
-          <span>+{fmt(node.soldLastSec)}g/s</span>
-        ) : (
-          <>
-            <span className="status-dot" />
-            <span>{STATUS_TEXT[node.status]}</span>
-            <span className="foot-rate">{+nodeRate(node, scenario).toFixed(2)}/s</span>
-          </>
-        )}
-      </div>
-      {node.kind !== 'market' && <div className="out-fill" style={{ width: `${(node.outBuf / BUFFER_CAP) * 100}%` }} />}
+      <div className="node-foot">{foot}</div>
+      {(node.kind === 'facility' || node.kind === 'supplier') && (
+        <div className="out-fill" style={{ width: `${(node.outBuf / BUFFER_CAP) * 100}%` }} />
+      )}
     </div>
   );
 }
 
-function NodeInspector({
-  node,
-  state,
-  scenario,
-  cmd,
-  onClose,
-}: {
+type InspectorProps = {
   node: FlowNode;
   state: FlowState;
   scenario: ScenarioConfig;
   cmd: (c: FlowCommand) => void;
   onClose: () => void;
-}) {
+};
+
+function InspectorHead({ title, onClose }: { title: string; onClose: () => void }) {
+  return (
+    <div className="inspector-head">
+      <h3>{title}</h3>
+      <button className="x" onClick={onClose} aria-label="Close">
+        ×
+      </button>
+    </div>
+  );
+}
+
+function NodeInspector(props: InspectorProps) {
+  const { node } = props;
+  if (node.kind === 'wallet') return <WalletInspector {...props} />;
+  if (node.kind === 'budget') return <BudgetInspector {...props} />;
+  if (node.kind === 'borrower') return <BorrowerInspector {...props} />;
+  return <BlockInspector {...props} />;
+}
+
+// Why a block isn't paid for, or null when it is.
+function upkeepHint(node: FlowNode, state: FlowState): string | null {
+  const payers = payersOf(state, node);
+  if (node.unpaid > 0)
+    return payers.length
+      ? `What pays it ran dry, so ${fmt(node.unpaid)}g of upkeep is unpaid and it has stopped. Add money, or wire in the Budget.`
+      : 'Nobody pays its upkeep, so it has stopped. Drag from a Wallet’s or the Budget’s port to it.';
+  if (!payers.length) return `Nothing pays its upkeep. It stops at the next bill unless you wire in a Wallet or the Budget.`;
+  return null;
+}
+
+function BlockInspector({ node, state, scenario, cmd, onClose }: InspectorProps) {
   const inputs = nodeInputs(node, scenario);
-  const up = node.kind === 'market' ? 0 : levelUpCost(node, scenario);
-  const name =
-    node.kind === 'facility' ? facilityDef(scenario, node.facilityType!).name : node.kind === 'market' ? 'Market' : `${product(scenario, node.productId!).name} Supplier`;
+  const up = isUpgradable(node) ? levelUpCost(node, scenario) : 0;
   const outgoing = state.wires.filter((w) => w.from === node.id).length;
+  const payers = payersOf(state, node);
+  const unpaidHint = upkeepHint(node, state);
   return (
     <div className="inspector">
-      <div className="inspector-head">
-        <h3>{name}</h3>
-        <button className="x" onClick={onClose}>
-          ×
-        </button>
-      </div>
-      {node.kind !== 'market' && (
+      <InspectorHead title={nodeName(node, scenario)} onClose={onClose} />
+      {unpaidHint && <p className="hint status-unpaid">{unpaidHint}</p>}
+      {node.kind === 'market' && node.money >= 1 && !outgoing && (
+        <p className="hint status-starved">Takings are piling up here. Wire the Market to a Wallet or the Budget to collect them.</p>
+      )}
+      {node.kind !== 'market' && node.status !== 'unpaid' && (
         <p className={`hint status-${node.status}`}>
-          {node.status === 'starved' && (node.kind === 'supplier' ? 'Out of cash to buy with.' : `Waiting on ${inputs.map((i) => product(scenario, i.id).name).join(' and ')}. Wire a producer into it.`)}
+          {node.status === 'starved' &&
+            (node.kind === 'supplier'
+              ? 'Whatever pays for it can’t afford more stock.'
+              : `Waiting on ${inputs.map((i) => product(scenario, i.id).name).join(' and ')}. Wire a producer into it.`)}
           {node.status === 'blocked' && (outgoing ? 'Output is backed up. Upgrade its wire or add another route.' : 'Output has nowhere to go. Drag from its port to a buyer.')}
           {node.status === 'running' && 'Running smoothly.'}
           {node.status === 'idle' && 'Warming up.'}
@@ -546,33 +775,154 @@ function NodeInspector({
         {node.kind === 'supplier' && (
           <>
             <dt>Buys at</dt>
-            <dd>{(state.market[node.productId!].price * SUPPLIER_MARKUP).toFixed(1)}g each</dd>
+            <dd>{(state.market[node.productId!].price * SUPPLIER_MARKUP).toFixed(1)}g each, from whoever pays it</dd>
           </>
         )}
         {node.kind === 'market' && (
           <>
             <dt>Earning</dt>
             <dd>{fmt(node.soldLastSec)}g/s</dd>
+            <dt>Not yet collected</dt>
+            <dd>{fmt(node.money)}g</dd>
           </>
         )}
         <dt>Upkeep</dt>
         <dd>{nodeUpkeep(node, scenario)}g per bill</dd>
+        <dt>Paid by</dt>
+        <dd>{payers.length ? payers.map((p) => nodeName(p.node, scenario)).join(', then ') : 'nobody'}</dd>
       </dl>
       <div className="inspector-actions">
-        {node.kind !== 'market' && (
+        {isUpgradable(node) && (
           <button className="primary" disabled={state.cash < up} onClick={() => cmd({ kind: 'levelUp', nodeId: node.id })}>
             Upgrade to L{node.level + 1} · {fmt(up)}g
           </button>
         )}
-        <button
-          onClick={() => {
-            cmd({ kind: 'sellNode', nodeId: node.id });
-            onClose();
-          }}
-        >
-          Sell for {fmt(node.invested * NODE_RESALE_RATE)}g
+        <SellButton node={node} cmd={cmd} onClose={onClose} />
+      </div>
+    </div>
+  );
+}
+
+function SellButton({ node, cmd, onClose }: { node: FlowNode; cmd: (c: FlowCommand) => void; onClose: () => void }) {
+  return (
+    <button
+      onClick={() => {
+        cmd({ kind: 'sellNode', nodeId: node.id });
+        onClose();
+      }}
+    >
+      Sell for {fmt(node.invested * NODE_RESALE_RATE + node.money)}g
+    </button>
+  );
+}
+
+function WalletInspector({ node, state, scenario, cmd, onClose }: InspectorProps) {
+  const [amount, setAmount] = useState(100);
+  const pays = state.wires.filter((w) => w.from === node.id && isPayLink(state, w)).length;
+  return (
+    <div className="inspector">
+      <InspectorHead title="Wallet" onClose={onClose} />
+      <p className={'hint' + (node.unpaid > 0 ? ' status-unpaid' : '')}>
+        {node.unpaid > 0
+          ? 'Empty, so it can’t pay its own upkeep or anyone else’s. Move money in.'
+          : 'Pays the upkeep of every block it’s wired into. A wire into the Budget sends everything above the next bill.'}
+      </p>
+      <dl className="facts">
+        <dt>Balance</dt>
+        <dd>{fmt(node.money)}g</dd>
+        <dt>Upkeep</dt>
+        <dd>{nodeUpkeep(node, scenario)}g per bill, paid by itself</dd>
+        <dt>Pays for</dt>
+        <dd>
+          {pays} block{pays === 1 ? '' : 's'}
+        </dd>
+        <dt>Keeps for next bill</dt>
+        <dd>{fmt(walletReserve(state, node, scenario))}g</dd>
+      </dl>
+      <div className="transfer">
+        <input type="number" min={0} step={50} value={amount} onChange={(e) => setAmount(Math.max(0, Math.round(Number(e.target.value)) || 0))} />
+        <span>g</span>
+        <button disabled={state.cash <= 0 || amount <= 0} onClick={() => cmd({ kind: 'transferMoney', nodeId: node.id, amount })}>
+          From Budget
+        </button>
+        <button disabled={node.money < 1 || amount <= 0} onClick={() => cmd({ kind: 'transferMoney', nodeId: node.id, amount: -amount })}>
+          To Budget
         </button>
       </div>
+      <div className="inspector-actions">
+        <SellButton node={node} cmd={cmd} onClose={onClose} />
+      </div>
+    </div>
+  );
+}
+
+function BudgetInspector({ node, state, cmd, onClose }: InspectorProps) {
+  const count = state.nodes.filter((n) => n.kind === 'budget').length;
+  return (
+    <div className="inspector">
+      <InspectorHead title="Budget" onClose={onClose} />
+      <p className="hint">
+        Your global cash. Building, wires and upgrades are paid from here, and it pays the upkeep or installments of any block you wire
+        it into. Collect money into it with wires from a Market, Wallet or Borrower. Fund a Wallet from that Wallet’s panel.
+      </p>
+      <dl className="facts">
+        <dt>Balance</dt>
+        <dd>{fmt(state.cash)}g</dd>
+        <dt>Owed on loans</dt>
+        <dd>{fmt(debt(state))}g</dd>
+        <dt>Upkeep</dt>
+        <dd>none</dd>
+        <dt>Budget blocks</dt>
+        <dd>{count}, all one balance</dd>
+      </dl>
+      {count > 1 && (
+        <div className="inspector-actions">
+          <button
+            onClick={() => {
+              cmd({ kind: 'sellNode', nodeId: node.id });
+              onClose();
+            }}
+          >
+            Remove this Budget block
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BorrowerInspector({ node, state, cmd, onClose }: InspectorProps) {
+  const l = node.loan!;
+  const payers = payersOf(state, node);
+  const collecting = state.wires.some((w) => w.from === node.id);
+  return (
+    <div className="inspector">
+      <InspectorHead title={`${l.label} loan`} onClose={onClose} />
+      {node.money >= 1 && !collecting && <p className="hint status-starved">Wire it to a Wallet or the Budget to collect the money.</p>}
+      <p className={'hint' + (payers.length ? '' : ' status-unpaid')}>
+        {payers.length
+          ? `Collects ${l.installmentPerCycle}g every bill from what’s wired into it.`
+          : 'Nothing repays it. Wire a Wallet or the Budget into it, or every installment becomes arrears.'}
+      </p>
+      <dl className="facts">
+        <dt>Still to send</dt>
+        <dd>{fmt(node.money)}g</dd>
+        <dt>Left to repay</dt>
+        <dd>{fmt(l.balance)}g</dd>
+        <dt>Each bill</dt>
+        <dd>{l.installmentPerCycle}g</dd>
+        <dt>Arrears</dt>
+        <dd className={l.arrears > 0 ? 'down' : ''}>{fmt(l.arrears)}g</dd>
+        <dt>Upkeep</dt>
+        <dd>none</dd>
+      </dl>
+      {l.arrears > 0 && (
+        <div className="inspector-actions">
+          <button className="primary" disabled={state.cash <= 0} onClick={() => cmd({ kind: 'payArrears', nodeId: node.id })}>
+            Pay arrears from Budget · {fmt(Math.min(l.arrears, state.cash))}g
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -591,26 +941,29 @@ function WireInspector({
   onClose: () => void;
 }) {
   const cost = wireUpgradeCost(wire);
+  const pay = isPayLink(state, wire);
+  const money = wire.productId === MONEY;
+  const to = state.nodes.find((n) => n.id === wire.to);
   return (
     <div className="inspector">
-      <div className="inspector-head">
-        <h3>{product(scenario, wire.productId).name} line</h3>
-        <button className="x" onClick={onClose}>
-          ×
-        </button>
-      </div>
-      <dl className="facts">
-        <dt>Carrying</dt>
-        <dd>
-          {wire.movedLastSec} of {wireCapacity(wire)}/s
-        </dd>
-        <dt>Level</dt>
-        <dd>{wire.level}</dd>
-      </dl>
+      <InspectorHead title={pay ? 'Payment link' : money ? 'Money line' : `${product(scenario, wire.productId).name} line`} onClose={onClose} />
+      {pay && to && <p className="hint">Pays the {to.kind === 'borrower' ? 'installments' : 'upkeep'} of {nodeName(to, scenario)} when each bill falls due.</p>}
+      {!pay && (
+        <dl className="facts">
+          <dt>Carrying</dt>
+          <dd>
+            {money ? `${fmt(wire.movedLastSec)}g of ${wireCapacity(wire)}g/s` : `${wire.movedLastSec} of ${wireCapacity(wire)}/s`}
+          </dd>
+          <dt>Level</dt>
+          <dd>{wire.level}</dd>
+        </dl>
+      )}
       <div className="inspector-actions">
-        <button className="primary" disabled={state.cash < cost} onClick={() => cmd({ kind: 'upgradeWire', wireId: wire.id })}>
-          Double capacity · {fmt(cost)}g
-        </button>
+        {!pay && (
+          <button className="primary" disabled={state.cash < cost} onClick={() => cmd({ kind: 'upgradeWire', wireId: wire.id })}>
+            Double capacity · {fmt(cost)}g
+          </button>
+        )}
         <button
           onClick={() => {
             cmd({ kind: 'removeWire', wireId: wire.id });
@@ -624,16 +977,18 @@ function WireInspector({
   );
 }
 
-function Overview({ state, scenario }: { state: FlowState; scenario: ScenarioConfig }) {
+function Overview({ state, scenario, onClose }: { state: FlowState; scenario: ScenarioConfig; onClose: () => void }) {
   return (
     <div className="inspector">
-      <h3>How it works</h3>
+      <InspectorHead title="How it works" onClose={onClose} />
       <ol className="howto">
-        <li>Drag from a node’s coloured output port to another node to lay a wire ({WIRE_COST}g).</li>
-        <li>Raw goods flow into processors, finished goods flow into a Market for cash.</li>
-        <li>Each wire carries a few units a second. Upgrade busy ones.</li>
+        <li>Drag from a block’s output port to another block to lay a wire ({WIRE_COST}g).</li>
+        <li>Goods flow from farms through processors into a Market. The Market holds its takings until a gold money wire carries them to a Wallet or the Budget.</li>
+        <li>Every block’s upkeep is paid by a Wallet or the Budget wired into it (Wallets first). A block nobody pays stops.</li>
+        <li>The Budget pays for building. Fund a Wallet when you open it, or move money from the Wallet’s panel.</li>
+        <li>A loan arrives as a Borrower. Wire it out to collect the money, and wire a Wallet or the Budget in to repay it.</li>
         <li>Flooding the market with one good drops its price. Process it into something worth more.</li>
-        <li>Every {FLOW_SETTLE_SEC}s you pay upkeep and loan installments.</li>
+        <li>Bills fall due every {FLOW_SETTLE_SEC}s.</li>
       </ol>
       <h3>Prices</h3>
       <table className="price-table">
