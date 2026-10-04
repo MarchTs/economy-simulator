@@ -10,10 +10,10 @@
 // the blocks wired to it, and a block nobody pays stops. A Borrower is a
 // loan: it pushes its principal down a money wire, and collects each
 // installment from the Wallet or Budget wired into it. Money wires either
-// FLOW (into a Wallet or the Budget, continuously, capped per second) or PAY
+// FLOW (into a Wallet or the Budget, continuously, with no limit) or PAY
 // (into any other block, drawn only when a bill falls due).
 // Pure functions over a JSON-serializable FlowState, like the classic engine.
-import { LOAN_OFFERS, type ScenarioConfig } from '../engine/sim';
+import { LOAN_OFFERS, type LoanOffer, type ScenarioConfig } from '../engine/sim';
 import { nextRandom, randomRange } from '../engine/rng';
 
 // ---------------------------------------------------------------------------
@@ -42,6 +42,7 @@ export interface FlowNode {
   money: number; // wallet balance, market takings not yet collected, borrower principal not yet sent
   unpaid: number; // upkeep owed and not yet paid; the block stops while this is > 0
   loan: FlowLoan | null; // borrower only
+  demand: number; // supplier only: units/second the player has it buy
 }
 
 export interface Wire {
@@ -92,13 +93,14 @@ export interface FlowState {
 
 export const FLOW_SETTLE_SEC = 30;
 export const START_CASH = 600;
-export const BUFFER_CAP = 10; // per input product, and for the output buffer
+export const BUFFER_CAP = 10; // per input product, and for the output buffer; × level for a facility
 export const WIRE_COST = 25;
 export const WIRE_BASE_RATE = 2; // units/second at wire level 1 (doubles per level)
 export const WIRE_UPGRADE_BASE = 80; // × current level
 export const MARKET_COST = 300;
 export const SUPPLIER_COST = 250;
-export const SUPPLIER_RATE = 1; // units/second at level 1
+export const SUPPLIER_DEFAULT_DEMAND = 1; // units/second a new supplier buys
+export const SUPPLIER_MAX_DEMAND = 20;
 export const SUPPLIER_MARKUP = 1.15; // pays this × spot for what it buys
 export const NODE_RESALE_RATE = 0.7;
 export const LEVELUP_FACTOR = 0.6;
@@ -106,13 +108,20 @@ export const GLUT_DECAY = 0.05; // fraction of glut forgotten per second
 export const DEMAND_BY_TIER = [60, 40, 25, 15]; // glut that halves the price
 export const ARREARS_PENALTY = 0.1;
 export const MONEY = '$money'; // the productId a money wire carries
-export const MONEY_WIRE_RATE = 20; // gold/second at wire level 1 (doubles per level)
 export const WALLET_COST = 100;
 export const WALLET_UPKEEP = 2;
 export const MARKET_UPKEEP = 5;
-export const SUPPLIER_UPKEEP = 4; // × level
+export const SUPPLIER_UPKEEP = 4; // per unit/second of demand, rounded up
 export const STARTER_WALLET_FUND = 100;
 const EPS = 1e-9;
+export const FLOW_LOAN_TERM = 20; // bills
+
+// The classic game's loans, repaid over FLOW_LOAN_TERM bills: same amount
+// borrowed, same total repaid, bigger installments.
+export const FLOW_LOAN_OFFERS: LoanOffer[] = LOAN_OFFERS.map((o) => {
+  const installmentPerCycle = Math.ceil(o.totalRepay / FLOW_LOAN_TERM);
+  return { ...o, installmentPerCycle, termCycles: FLOW_LOAN_TERM, totalRepay: installmentPerCycle * FLOW_LOAN_TERM };
+});
 const HISTORY_CAP = 120;
 
 // ---------------------------------------------------------------------------
@@ -139,20 +148,21 @@ export function facilityDef(scenario: ScenarioConfig, type: string) {
 // Units/second a node can emit at its level (0 for the market).
 export function nodeRate(node: FlowNode, scenario: ScenarioConfig): number {
   if (node.kind === 'facility') return facilityDef(scenario, node.facilityType!).baseRatePerSec * node.level;
-  if (node.kind === 'supplier') return SUPPLIER_RATE * node.level;
+  if (node.kind === 'supplier') return node.demand;
   return 0;
 }
 
 export function nodeUpkeep(node: FlowNode, scenario: ScenarioConfig): number {
   if (node.kind === 'facility') return facilityDef(scenario, node.facilityType!).upkeepPerCycle * node.level;
-  if (node.kind === 'supplier') return SUPPLIER_UPKEEP * node.level;
+  if (node.kind === 'supplier') return Math.ceil(SUPPLIER_UPKEEP * node.demand);
   if (node.kind === 'market') return MARKET_UPKEEP;
   if (node.kind === 'wallet') return WALLET_UPKEEP;
   return 0; // the Budget and Borrowers cost nothing to keep
 }
 
+// Only facilities level up; a supplier is tuned by its demand instead.
 export function isUpgradable(node: FlowNode): boolean {
-  return node.kind === 'facility' || node.kind === 'supplier';
+  return node.kind === 'facility';
 }
 
 // Every block emits at most one thing: a good, or money.
@@ -181,13 +191,31 @@ export function nodeInputs(node: FlowNode, scenario: ScenarioConfig): { id: stri
   return product(scenario, node.productId!).inputs;
 }
 
-export function levelUpCost(node: FlowNode, scenario: ScenarioConfig): number {
-  const base = node.kind === 'facility' ? facilityDef(scenario, node.facilityType!).buildCost : SUPPLIER_COST;
-  return Math.round(base * LEVELUP_FACTOR * node.level);
+// A facility works in batches that grow with its level: an L2 Malthouse turns
+// 4 Barley into 2 Malt at the same batches per second as an L1 turns 2 into 1.
+export function batchSize(node: FlowNode): number {
+  return node.kind === 'facility' ? node.level : 1;
 }
 
+// One batch's inputs at the node's level.
+export function batchInputs(node: FlowNode, scenario: ScenarioConfig): { id: string; qty: number }[] {
+  return nodeInputs(node, scenario).map((i) => ({ id: i.id, qty: i.qty * batchSize(node) }));
+}
+
+// How much of each input, and of its output, a node can hold. Grows with a
+// facility's level so a batch always fits.
+export function bufferCap(node: FlowNode): number {
+  if (node.kind === 'supplier') return Math.max(BUFFER_CAP, Math.ceil(node.demand)); // a second's buying always fits
+  return BUFFER_CAP * batchSize(node);
+}
+
+export function levelUpCost(node: FlowNode, scenario: ScenarioConfig): number {
+  return Math.round(facilityDef(scenario, node.facilityType!).buildCost * LEVELUP_FACTOR * node.level);
+}
+
+// Goods wires carry a few units a second; money wires carry any amount, so they never upgrade.
 export function wireCapacity(w: Wire): number {
-  return (w.productId === MONEY ? MONEY_WIRE_RATE : WIRE_BASE_RATE) * 2 ** (w.level - 1);
+  return w.productId === MONEY ? Infinity : WIRE_BASE_RATE * 2 ** (w.level - 1);
 }
 
 export function wireUpgradeCost(w: Wire): number {
@@ -325,6 +353,7 @@ function makeNode(state: FlowState, kind: NodeKind, x: number, y: number, facili
     money: 0,
     unpaid: 0,
     loan: null,
+    demand: 0,
   };
 }
 
@@ -390,13 +419,20 @@ export function tickFlow(prev: FlowState, scenario: ScenarioConfig): FlowState {
       if (n.kind !== 'market') n.status = 'running';
       continue;
     }
-    const room = BUFFER_CAP - n.outBuf;
+    if (nodeRate(n, scenario) <= 0) {
+      n.status = 'idle'; // a supplier set to buy nothing
+      n.accumulator = 0;
+      continue;
+    }
+    // Work in whole batches; the accumulator counts batches, not units.
+    const batch = batchSize(n);
+    const room = Math.floor((bufferCap(n) - n.outBuf) / batch);
     if (room <= 0) {
       n.status = 'blocked';
       n.accumulator = 0;
       continue;
     }
-    n.accumulator += nodeRate(n, scenario);
+    n.accumulator += nodeRate(n, scenario) / batch;
     let want = Math.min(room, Math.floor(n.accumulator));
     if (want <= 0) {
       n.status = n.status === 'idle' ? 'running' : n.status;
@@ -410,11 +446,12 @@ export function tickFlow(prev: FlowState, scenario: ScenarioConfig): FlowState {
       const cost = draw(state, payers, unit * want);
       state.totals.suppliesG += cost;
     } else {
-      for (const inp of nodeInputs(n, scenario)) want = Math.min(want, Math.floor((n.inBuf[inp.id] ?? 0) / inp.qty));
-      for (const inp of nodeInputs(n, scenario)) n.inBuf[inp.id] = (n.inBuf[inp.id] ?? 0) - inp.qty * want;
+      const inputs = batchInputs(n, scenario);
+      for (const inp of inputs) want = Math.min(want, Math.floor((n.inBuf[inp.id] ?? 0) / inp.qty));
+      for (const inp of inputs) n.inBuf[inp.id] = (n.inBuf[inp.id] ?? 0) - inp.qty * want;
     }
-    n.outBuf += want;
-    n.madeLastSec = want;
+    n.outBuf += want * batch;
+    n.madeLastSec = want * batch;
     n.accumulator -= want;
     if (want === 0) {
       n.accumulator = 0;
@@ -443,7 +480,7 @@ export function tickFlow(prev: FlowState, scenario: ScenarioConfig): FlowState {
           state.totals.salesG += earned;
           to.soldLastSec += earned;
         } else {
-          if ((to.inBuf[w.productId] ?? 0) >= BUFFER_CAP) continue;
+          if ((to.inBuf[w.productId] ?? 0) >= bufferCap(to)) continue;
           to.inBuf[w.productId] = (to.inBuf[w.productId] ?? 0) + 1;
         }
         n.outBuf -= 1;
@@ -455,25 +492,21 @@ export function tickFlow(prev: FlowState, scenario: ScenarioConfig): FlowState {
   }
   for (const n of state.nodes) if (n.kind === 'market' && n.unpaid <= EPS) n.status = n.soldLastSec > 0 ? 'running' : 'idle';
 
-  // 3. Money moves along its flow wires (into Wallets and the Budget), split
-  // evenly between them, each capped per second. A Wallet keeps back its next bill.
+  // 3. Money moves along its flow wires (into Wallets and the Budget) all at
+  // once, split evenly between them. A Wallet keeps back its next bill.
   for (const n of state.nodes) {
     if (n.kind !== 'market' && n.kind !== 'wallet' && n.kind !== 'borrower') continue;
-    let left = n.kind === 'wallet' ? Math.max(0, n.money - walletReserve(state, n, scenario)) : n.money;
-    let open = state.wires.filter((w) => w.from === n.id && w.productId === MONEY && !isPayLink(state, w));
-    while (left > EPS && open.length) {
-      const share = left / open.length;
-      for (const w of open) {
-        const give = Math.min(share, wireCapacity(w) - w.movedLastSec);
-        const to = byId.get(w.to)!;
-        if (to.kind === 'budget') state.cash += give;
-        else to.money += give;
-        n.money -= give;
-        w.movedLastSec += give;
-        left -= give;
-      }
-      open = open.filter((w) => wireCapacity(w) - w.movedLastSec > EPS);
+    const send = n.kind === 'wallet' ? Math.max(0, n.money - walletReserve(state, n, scenario)) : n.money;
+    const flows = state.wires.filter((w) => w.from === n.id && w.productId === MONEY && !isPayLink(state, w));
+    if (send <= EPS || !flows.length) continue;
+    const share = send / flows.length;
+    for (const w of flows) {
+      const to = byId.get(w.to)!;
+      if (to.kind === 'budget') state.cash += share;
+      else to.money += share;
+      w.movedLastSec = share;
     }
+    n.money -= send;
   }
 
   // 4. The market slowly forgets a glut.
@@ -553,6 +586,7 @@ export type FlowCommand =
   | { kind: 'buildMarket'; x: number; y: number }
   | { kind: 'buildSupplier'; productId: string; x: number; y: number }
   | { kind: 'buildWallet'; fund: number; x: number; y: number }
+  | { kind: 'setDemand'; nodeId: string; demand: number } // supplier: units/second to buy
   | { kind: 'buildBudget'; x: number; y: number }
   | { kind: 'transferMoney'; nodeId: string; amount: number } // + Budget → Wallet, − Wallet → Budget
   | { kind: 'connect'; from: string; to: string }
@@ -587,7 +621,15 @@ export function applyFlowCommand(prev: FlowState, cmd: FlowCommand, scenario: Sc
     case 'buildSupplier': {
       if (!state.market[cmd.productId]) break;
       if (!spend(SUPPLIER_COST, `Signed a ${product(scenario, cmd.productId).name} supplier`)) break;
-      state.nodes.push(makeNode(state, 'supplier', cmd.x, cmd.y, null, cmd.productId, SUPPLIER_COST));
+      const sup = makeNode(state, 'supplier', cmd.x, cmd.y, null, cmd.productId, SUPPLIER_COST);
+      sup.demand = SUPPLIER_DEFAULT_DEMAND;
+      state.nodes.push(sup);
+      break;
+    }
+    case 'setDemand': {
+      const n = state.nodes.find((x) => x.id === cmd.nodeId);
+      if (!n || n.kind !== 'supplier' || !Number.isFinite(cmd.demand)) break;
+      n.demand = Math.max(0, Math.min(SUPPLIER_MAX_DEMAND, Math.round(cmd.demand * 10) / 10));
       break;
     }
     case 'buildWallet': {
@@ -629,7 +671,7 @@ export function applyFlowCommand(prev: FlowState, cmd: FlowCommand, scenario: Sc
     }
     case 'upgradeWire': {
       const w = state.wires.find((x) => x.id === cmd.wireId);
-      if (!w || !spend(wireUpgradeCost(w), `Upgraded a ${w.productId === MONEY ? 'money' : product(scenario, w.productId).name} line`)) break;
+      if (!w || w.productId === MONEY || !spend(wireUpgradeCost(w), `Upgraded a ${product(scenario, w.productId).name} line`)) break;
       w.level += 1;
       break;
     }
@@ -655,7 +697,7 @@ export function applyFlowCommand(prev: FlowState, cmd: FlowCommand, scenario: Sc
     }
     case 'takeLoan': {
       if (hasArrears(state)) break;
-      const offer = LOAN_OFFERS.find((o) => o.id === cmd.offerId);
+      const offer = FLOW_LOAN_OFFERS.find((o) => o.id === cmd.offerId);
       if (!offer) break;
       const b = makeNode(state, 'borrower', cmd.x, cmd.y, null, null, 0);
       b.money = offer.principal;

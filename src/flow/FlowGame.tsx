@@ -1,12 +1,15 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import './flow.css';
-import { LOAN_OFFERS, type ScenarioConfig } from '../engine/sim';
+import { type ScenarioConfig } from '../engine/sim';
 import {
   applyFlowCommand,
-  BUFFER_CAP,
+  batchInputs,
+  batchSize,
+  bufferCap,
   canConnect,
   connectRule,
   debt,
+  FLOW_LOAN_OFFERS,
   FLOW_SETTLE_SEC,
   hasArrears,
   inputRows,
@@ -28,6 +31,8 @@ import {
   salePrice,
   SUPPLIER_COST,
   SUPPLIER_MARKUP,
+  SUPPLIER_MAX_DEMAND,
+  SUPPLIER_UPKEEP,
   tickFlow,
   walletReserve,
   WALLET_COST,
@@ -49,7 +54,7 @@ const CANVAS_H = 1600;
 const ZOOM_MIN = 0.4;
 const ZOOM_MAX = 2;
 const ZOOM_STEP = 1.2;
-const NODE_H_EST = 110; // a node card's rough height, for fitting the view around nodes
+const FOOT_H = 26; // a node card's footer, for fitting the view around nodes
 const MONEY_COLOR = '#f2d16b';
 const PRODUCT_COLORS = ['#e8a33d', '#8fbf6f', '#6fb0d6', '#d68a6f', '#c79be0', '#e0d36f', '#6fd6c0', '#e06c9b'];
 
@@ -139,7 +144,7 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
     const minX = Math.min(...state.nodes.map((n) => n.x)) - pad;
     const minY = Math.min(...state.nodes.map((n) => n.y)) - pad;
     const maxX = Math.max(...state.nodes.map((n) => n.x + NODE_W)) + pad;
-    const maxY = Math.max(...state.nodes.map((n) => n.y + NODE_H_EST)) + pad;
+    const maxY = Math.max(...state.nodes.map((n) => n.y + HEADER + ROW * layouts.get(n.id)!.rows + FOOT_H)) + pad;
     const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.min(w.clientWidth / (maxX - minX), w.clientHeight / (maxY - minY))));
     pendingScroll.current = {
       left: ((minX + maxX) / 2) * next - w.clientWidth / 2,
@@ -206,6 +211,7 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
   });
 
   const nodeById = new Map(state.nodes.map((n) => [n.id, n]));
+  const layouts = new Map(state.nodes.map((n) => [n.id, portLayout(n, state, scenario)]));
   const dragFrom = drag?.kind === 'wire' ? nodeById.get(drag.from) : undefined;
   const selectedNode = selection?.kind === 'node' ? nodeById.get(selection.id) : undefined;
   const selectedWire = selection?.kind === 'wire' ? state.wires.find((w) => w.id === selection.id) : undefined;
@@ -290,7 +296,10 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
                 <b>Supplier</b>
                 <span className="cost">{SUPPLIER_COST}g</span>
               </span>
-              <span className="palette-sub">Buys a good at {Math.round((SUPPLIER_MARKUP - 1) * 100)}% over spot and feeds it in.</span>
+              <span className="palette-sub">
+                Buys a good at {Math.round((SUPPLIER_MARKUP - 1) * 100)}% over spot and feeds it in. Set how much it buys; upkeep is{' '}
+                {SUPPLIER_UPKEEP}g per unit/s.
+              </span>
               <div className="supplier-controls">
                 <select value={supplierProduct} onChange={(e) => setSupplierProduct(e.target.value)}>
                   {scenario.products.map((p) => (
@@ -341,7 +350,7 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
           </button>
 
           <h3>Borrow</h3>
-            {LOAN_OFFERS.map((o) => (
+            {FLOW_LOAN_OFFERS.map((o) => (
               <button key={o.id} className="palette-item" disabled={hasArrears(state)} onClick={() => cmd({ kind: 'takeLoan', offerId: o.id, ...spawnPoint() })}>
                 <span className="palette-top">
                   <b>{o.label}</b>
@@ -377,8 +386,8 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
                     const from = nodeById.get(w.from);
                     const to = nodeById.get(w.to);
                     if (!from || !to) return null;
-                    const a = outPort(from);
-                    const b = inPort(to, w.productId, scenario);
+                    const a = portPoint(from, layouts.get(from.id)!.outs, w.id, 'out');
+                    const b = portPoint(to, layouts.get(to.id)!.ins, w.id, 'in');
                     return (
                       <WirePath
                         key={w.id}
@@ -393,7 +402,7 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
                     );
                   })}
                   {dragFrom && (
-                    <path className="wire-pending" d={curve(outPort(dragFrom), cursor)} stroke={colorOf(outputOf(dragFrom)!)} />
+                    <path className="wire-pending" d={curve(portPoint(dragFrom, layouts.get(dragFrom.id)!.outs, null, 'out'), cursor)} stroke={colorOf(outputOf(dragFrom)!)} />
                   )}
                 </svg>
 
@@ -403,6 +412,7 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
                     node={n}
                     state={state}
                     scenario={scenario}
+                    layout={layouts.get(n.id)!}
                     colorOf={colorOf}
                     selected={selection?.kind === 'node' && selection.id === n.id}
                     dropTarget={dragFrom ? (connectRule(dragFrom, n, scenario) === null ? 'ok' : 'no') : null}
@@ -493,19 +503,38 @@ function BillPie({ elapsed, speed }: { elapsed: number; speed: number }) {
 
 type Pt = { x: number; y: number };
 
-function portRows(node: FlowNode, scenario: ScenarioConfig) {
-  return Math.max(1, inputRows(node, scenario).length);
+// Every dot holds one wire. A block shows a dot per wire it has, and one free
+// dot per port for the next connection. Inputs are grouped by kind (each good
+// a facility uses, the market's any-good port, the money port), outputs stack
+// down the right-hand side.
+type Slot = { key: string; wireId: string | null; row: number };
+type InSlot = Slot & { kind: string; first: boolean };
+type PortLayout = { ins: InSlot[]; outs: Slot[]; rows: number };
+
+// Which input group a wire lands in on `node`.
+function inKindOf(node: FlowNode, w: Wire): string {
+  if (w.productId === MONEY) return MONEY;
+  return node.kind === 'market' ? '*goods' : w.productId;
 }
 
-function outPort(n: FlowNode): Pt {
-  return { x: n.x + NODE_W, y: n.y + HEADER + ROW / 2 };
+function portLayout(node: FlowNode, state: FlowState, scenario: ScenarioConfig): PortLayout {
+  const ins: InSlot[] = [];
+  let row = 0;
+  for (const kind of inputRows(node, scenario)) {
+    const wires = state.wires.filter((w) => w.to === node.id && inKindOf(node, w) === kind);
+    wires.forEach((w, i) => ins.push({ key: w.id, kind, wireId: w.id, row: row++, first: i === 0 }));
+    ins.push({ key: `${kind}:free`, kind, wireId: null, row: row++, first: wires.length === 0 });
+  }
+  const outWires = state.wires.filter((w) => w.from === node.id);
+  const outs: Slot[] = outWires.map((w, i) => ({ key: w.id, wireId: w.id, row: i }));
+  outs.push({ key: 'out:free', wireId: null, row: outWires.length });
+  return { ins, outs, rows: Math.max(row, outs.length) };
 }
 
-function inPort(n: FlowNode, productId: string, scenario: ScenarioConfig): Pt {
-  const rows = inputRows(n, scenario);
-  let idx = rows.indexOf(productId);
-  if (idx < 0) idx = Math.max(0, rows.indexOf('*goods'));
-  return { x: n.x, y: n.y + HEADER + ROW * idx + ROW / 2 };
+// Where a wire meets a block: its own dot, or the free dot when `wireId` is null.
+function portPoint(n: FlowNode, slots: Slot[], wireId: string | null, side: 'in' | 'out'): Pt {
+  const slot = slots.find((s) => s.wireId === wireId) ?? slots[slots.length - 1];
+  return { x: side === 'out' ? n.x + NODE_W : n.x, y: n.y + HEADER + ROW * slot.row + ROW / 2 };
 }
 
 function curve(a: Pt, b: Pt) {
@@ -541,7 +570,7 @@ function WirePath({
   // Dots travel faster the more the wire carries.
   const dur = wire.movedLastSec > 0 ? Math.max(0.35, 1.6 - load * 1.2) : 0;
   const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-  const label = pay ? 'pays' : money ? `${Math.round(wire.movedLastSec)}/${cap}g` : `${wire.movedLastSec}/${cap}`;
+  const label = pay ? 'pays' : money ? `${fmt(wire.movedLastSec)}g/s` : `${wire.movedLastSec}/${cap}`;
   const labelW = Math.max(44, label.length * 6.5 + 12);
   return (
     <g
@@ -573,6 +602,7 @@ function NodeCard({
   node,
   state,
   scenario,
+  layout,
   colorOf,
   selected,
   dropTarget,
@@ -583,6 +613,7 @@ function NodeCard({
   node: FlowNode;
   state: FlowState;
   scenario: ScenarioConfig;
+  layout: PortLayout;
   colorOf: (id: string) => string;
   selected: boolean;
   dropTarget: 'ok' | 'no' | null;
@@ -590,8 +621,7 @@ function NodeCard({
   onPortDown: (e: React.PointerEvent) => void;
   onSelect: () => void;
 }) {
-  const rows = inputRows(node, scenario);
-  const inputs = nodeInputs(node, scenario);
+  const inputs = batchInputs(node, scenario);
   const out = outputOf(node)!;
   const upkeep = nodeUpkeep(node, scenario);
 
@@ -619,6 +649,7 @@ function NodeCard({
     out !== MONEY ? (
       <>
         <span className="buf">{node.outBuf}</span>
+        {node.kind === 'facility' && `${batchSize(node)}× `}
         {product(scenario, out).name}
       </>
     ) : (
@@ -677,25 +708,54 @@ function NodeCard({
         <span className="node-title">{nodeName(node, scenario)}</span>
         {isUpgradable(node) && <span className="node-level">L{node.level}</span>}
       </div>
-      <div className="node-ports" style={{ height: ROW * portRows(node, scenario) }}>
-        {rows.map((id, i) => (
-          <div key={id} className="port-row" style={{ height: ROW }}>
-            <span className={'port in' + (id === MONEY ? ' money' : '')} style={id === MONEY || id === '*goods' ? undefined : { borderColor: colorOf(id) }} />
-            {inLabel(id)}
-            {i === 0 && (
-              <>
-                <span className="port-label out-label">{outLabel}</span>
-                <span className="port out" style={{ background: colorOf(out) }} onPointerDown={onPortDown} title="Drag to connect" />
-              </>
-            )}
-          </div>
-        ))}
+      <div className="node-ports" style={{ height: ROW * layout.rows }}>
+        {Array.from({ length: layout.rows }, (_, r) => {
+          const inSlot = layout.ins.find((s) => s.row === r);
+          const outSlot = layout.outs.find((s) => s.row === r);
+          const inColor = inSlot && inSlot.kind !== '*goods' ? colorOf(inSlot.kind) : undefined;
+          return (
+            <div key={r} className="port-row" style={{ height: ROW }}>
+              {inSlot && (
+                <span
+                  className={'port in' + (inSlot.wireId ? ' linked' : ' free')}
+                  style={inColor ? { borderColor: inColor, background: inSlot.wireId ? inColor : undefined } : undefined}
+                />
+              )}
+              {inSlot?.kind === '*goods' && inSlot.wireId ? (
+                <SalePriceLabel state={state} scenario={scenario} productId={state.wires.find((w) => w.id === inSlot.wireId)!.productId} />
+              ) : inSlot?.first ? (
+                inLabel(inSlot.kind)
+              ) : (
+                <span className="port-label" />
+              )}
+              {r === 0 && <span className="port-label out-label">{outLabel}</span>}
+              {outSlot &&
+                (outSlot.wireId ? (
+                  <span className="port out linked" style={{ background: colorOf(out) }} />
+                ) : (
+                  <span className="port out free" style={{ borderColor: colorOf(out) }} onPointerDown={onPortDown} title="Drag to connect" />
+                ))}
+            </div>
+          );
+        })}
       </div>
       <div className="node-foot">{foot}</div>
       {(node.kind === 'facility' || node.kind === 'supplier') && (
-        <div className="out-fill" style={{ width: `${(node.outBuf / BUFFER_CAP) * 100}%` }} />
+        <div className="out-fill" style={{ width: `${(node.outBuf / bufferCap(node)) * 100}%` }} />
       )}
     </div>
+  );
+}
+
+// What one unit on this wire fetches at the market right now; red while the good is glutted.
+function SalePriceLabel({ state, scenario, productId }: { state: FlowState; scenario: ScenarioConfig; productId: string }) {
+  const now = salePrice(state, scenario, productId);
+  const glutted = now < state.market[productId].price * 0.85;
+  return (
+    <span className="port-label unit-label" title={`${product(scenario, productId).name}: ${now.toFixed(1)}g per unit`}>
+      <span className="unit-name">{product(scenario, productId).name}</span>
+      <span className={'unit-price' + (glutted ? ' down' : '')}>{now.toFixed(1)}g each</span>
+    </span>
   );
 }
 
@@ -727,7 +787,8 @@ function NodeInspector(props: InspectorProps) {
 }
 
 // Why a block isn't paid for, or null when it is.
-function upkeepHint(node: FlowNode, state: FlowState): string | null {
+function upkeepHint(node: FlowNode, state: FlowState, scenario: ScenarioConfig): string | null {
+  if (node.unpaid <= 0 && nodeUpkeep(node, scenario) <= 0) return null; // nothing to pay
   const payers = payersOf(state, node);
   if (node.unpaid > 0)
     return payers.length
@@ -742,7 +803,7 @@ function BlockInspector({ node, state, scenario, cmd, onClose }: InspectorProps)
   const up = isUpgradable(node) ? levelUpCost(node, scenario) : 0;
   const outgoing = state.wires.filter((w) => w.from === node.id).length;
   const payers = payersOf(state, node);
-  const unpaidHint = upkeepHint(node, state);
+  const unpaidHint = upkeepHint(node, state, scenario);
   return (
     <div className="inspector">
       <InspectorHead title={nodeName(node, scenario)} onClose={onClose} />
@@ -758,16 +819,30 @@ function BlockInspector({ node, state, scenario, cmd, onClose }: InspectorProps)
               : `Waiting on ${inputs.map((i) => product(scenario, i.id).name).join(' and ')}. Wire a producer into it.`)}
           {node.status === 'blocked' && (outgoing ? 'Output is backed up. Upgrade its wire or add another route.' : 'Output has nowhere to go. Drag from its port to a buyer.')}
           {node.status === 'running' && 'Running smoothly.'}
-          {node.status === 'idle' && 'Warming up.'}
+          {node.status === 'idle' && (node.kind === 'supplier' && node.demand <= 0 ? 'Demand is 0, so it buys nothing.' : 'Warming up.')}
         </p>
       )}
       <dl className="facts">
         {node.productId && (
           <>
+            {node.kind === 'facility' && (
+              <>
+                <dt>Each batch</dt>
+                <dd>
+                  {batchInputs(node, scenario)
+                    .map((i) => `${i.qty} ${product(scenario, i.id).name}`)
+                    .join(' + ')}
+                  {nodeInputs(node, scenario).length ? ' → ' : ''}
+                  {batchSize(node)} {product(scenario, node.productId).name}
+                </dd>
+              </>
+            )}
             <dt>Makes</dt>
             <dd>
               {+nodeRate(node, scenario).toFixed(2)} {product(scenario, node.productId).name}/s
             </dd>
+            <dt>Holds</dt>
+            <dd>{node.kind === 'facility' ? `${bufferCap(node)} of each` : bufferCap(node)}</dd>
             <dt>Sells for now</dt>
             <dd>{salePrice(state, scenario, node.productId).toFixed(1)}g each</dd>
           </>
@@ -787,10 +862,26 @@ function BlockInspector({ node, state, scenario, cmd, onClose }: InspectorProps)
           </>
         )}
         <dt>Upkeep</dt>
-        <dd>{nodeUpkeep(node, scenario)}g per bill</dd>
+        <dd>
+          {nodeUpkeep(node, scenario)}g per bill{node.kind === 'supplier' && ` (${SUPPLIER_UPKEEP}g per unit/s)`}
+        </dd>
         <dt>Paid by</dt>
         <dd>{payers.length ? payers.map((p) => nodeName(p.node, scenario)).join(', then ') : 'nobody'}</dd>
       </dl>
+      {node.kind === 'supplier' && (
+        <label className="demand">
+          Demand
+          <input
+            type="number"
+            min={0}
+            max={SUPPLIER_MAX_DEMAND}
+            step={0.5}
+            value={node.demand}
+            onChange={(e) => cmd({ kind: 'setDemand', nodeId: node.id, demand: Number(e.target.value) })}
+          />
+          {product(scenario, node.productId!).name}/s
+        </label>
+      )}
       <div className="inspector-actions">
         {isUpgradable(node) && (
           <button className="primary" disabled={state.cash < up} onClick={() => cmd({ kind: 'levelUp', nodeId: node.id })}>
@@ -948,18 +1039,21 @@ function WireInspector({
     <div className="inspector">
       <InspectorHead title={pay ? 'Payment link' : money ? 'Money line' : `${product(scenario, wire.productId).name} line`} onClose={onClose} />
       {pay && to && <p className="hint">Pays the {to.kind === 'borrower' ? 'installments' : 'upkeep'} of {nodeName(to, scenario)} when each bill falls due.</p>}
+      {money && !pay && <p className="hint">Carries any amount, so it never needs upgrading.</p>}
       {!pay && (
         <dl className="facts">
           <dt>Carrying</dt>
-          <dd>
-            {money ? `${fmt(wire.movedLastSec)}g of ${wireCapacity(wire)}g/s` : `${wire.movedLastSec} of ${wireCapacity(wire)}/s`}
-          </dd>
-          <dt>Level</dt>
-          <dd>{wire.level}</dd>
+          <dd>{money ? `${fmt(wire.movedLastSec)}g/s` : `${wire.movedLastSec} of ${wireCapacity(wire)}/s`}</dd>
+          {!money && (
+            <>
+              <dt>Level</dt>
+              <dd>{wire.level}</dd>
+            </>
+          )}
         </dl>
       )}
       <div className="inspector-actions">
-        {!pay && (
+        {!money && (
           <button className="primary" disabled={state.cash < cost} onClick={() => cmd({ kind: 'upgradeWire', wireId: wire.id })}>
             Double capacity · {fmt(cost)}g
           </button>

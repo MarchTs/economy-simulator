@@ -176,3 +176,20 @@ div.palette-item { background: var(--panel-inset); border: 1px solid var(--borde
 .bill-pie-track { fill: #00000040; stroke: var(--border); stroke-width: 1.5; }
 .bill-pie-fill { fill: none; stroke: var(--amber); }
 .bill-pie.due .bill-pie-fill { stroke: var(--red); }
+
+/* ---- One wire per dot ---- */
+.port.in.free { border-style: dashed; }
+.port.in.linked { background: var(--muted); }
+.port.out.linked { cursor: default; }
+.port.out.linked:hover { transform: translate(-50%, -50%); }
+.port.out.free { background: var(--panel-solid); border: 2px dashed; box-shadow: none; }
+
+/* ---- Supplier demand ---- */
+.demand { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin: 0 0 12px; }
+.demand input { width: 80px; min-width: 0; }
+
+/* ---- Market unit prices ---- */
+.unit-label { min-width: 0; }
+.unit-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.unit-price { color: var(--text); font-variant-numeric: tabular-nums; flex: none; }
+.unit-price.down { color: var(--red); }
