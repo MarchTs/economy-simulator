@@ -67,7 +67,6 @@ div.palette-item { background: var(--panel-inset); border: 1px solid var(--borde
 .wire-base { fill: none; opacity: 0.35; }
 .wire-flow { fill: none; stroke-dasharray: 3 13; stroke-linecap: round; animation: wire-flow linear infinite; }
 .wire.selected .wire-base { opacity: 0.8; }
-.wire.maxed .wire-label { fill: var(--red); }
 .wire-label-bg { fill: #1a1108; stroke: var(--border); }
 .wire.selected .wire-label-bg { stroke: var(--amber); }
 .wire-label { fill: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
@@ -193,6 +192,8 @@ div.palette-item { background: var(--panel-inset); border: 1px solid var(--borde
 .unit-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .unit-price { color: var(--text); font-variant-numeric: tabular-nums; flex: none; }
 .unit-price.down { color: var(--red); }
+.unit-price.up { color: var(--green); }
+.price-table td.up { color: var(--green); }
 
 /* ---- Footers wrap whole phrases, never mid-phrase ---- */
 .node-foot { flex-wrap: wrap; row-gap: 2px; }
@@ -255,3 +256,10 @@ div.palette-item { background: var(--panel-inset); border: 1px solid var(--borde
 .license-sub { font-size: 12px; color: var(--muted); }
 .license-owned { margin-top: auto; font-size: 13px; color: var(--green); }
 .license button { margin-top: auto; font-size: 12.5px; padding: 4px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---- Equity meter: debt against its limit ---- */
+.debt-bar { display: block; height: 3px; margin-top: 3px; background: #00000055; border-radius: 2px; overflow: hidden; }
+.debt-fill { display: block; height: 100%; background: var(--green); transition: width 0.3s; }
+.debt-meter.near .debt-fill { background: var(--amber); }
+.debt-meter.over .debt-fill { background: var(--red); }
+.debt-meter.over .stat-value, .debt-meter.over .stat-label { color: var(--red); }

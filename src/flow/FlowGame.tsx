@@ -9,12 +9,15 @@ import {
   canConnect,
   connectRule,
   debt,
+  DEBT_LIMIT_MULTIPLE,
+  debtLimit,
   distributionOf,
   facilityDef,
   equity,
   FLOW_LOAN_OFFERS,
   FLOW_SETTLE_SEC,
   hasArrears,
+  loanBlocker,
   hasLicense,
   licenseBlocker,
   licenseCost,
@@ -24,7 +27,7 @@ import {
   isPayLink,
   isUpgradable,
   levelUpCost,
-  MARKET_COST,
+  MARKET_UPKEEP,
   MONEY,
   moveNode,
   newFlowGame,
@@ -37,6 +40,7 @@ import {
   payersOf,
   product,
   salePrice,
+  trendPerBill,
   SUPPLIER_COST,
   SUPPLIER_MARKUP,
   SUPPLIER_MAX_DEMAND,
@@ -44,9 +48,6 @@ import {
   tickFlow,
   walletReserve,
   WALLET_COST,
-  wireCapacity,
-  wireUpgradeCost,
-  WIRE_COST,
   type FlowBankruptcy,
   type FlowCommand,
   type FlowNode,
@@ -246,10 +247,7 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
           <span className="stat-label">Budget</span>
           <span className={'cash-value' + (state.cash < 0 ? ' negative' : '')}>{fmt(state.cash)}g</span>
         </div>
-        <div className="stat" title="Everything you own minus everything you owe. Below 0 at two bills in a row and the creditors liquidate.">
-          <span className="stat-label">{state.insolvent ? 'Equity · insolvent' : 'Equity'}</span>
-          <span className={'stat-value' + (equity(state) < 0 ? ' down' : '')}>{fmt(equity(state))}g</span>
-        </div>
+        <EquityMeter state={state} />
         <div className="stat">
           <span className="stat-label">Selling</span>
           <span className="stat-value up">+{fmt(salesPerSec)}g/s</span>
@@ -318,13 +316,13 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
                 </button>
               ) : null;
             })()}
-            <button className="palette-item" disabled={state.cash < MARKET_COST} onClick={() => cmd({ kind: 'buildMarket', ...spawnPoint() })}>
+            <button className="palette-item" onClick={() => cmd({ kind: 'buildMarket', ...spawnPoint() })}>
               <span className="palette-top">
                 <span className="swatch market" />
                 <b>Market stall</b>
-                <span className="cost">{MARKET_COST}g</span>
+                <span className="cost">free</span>
               </span>
-              <span className="palette-sub">Another place to sell. Same prices, same glut.</span>
+              <span className="palette-sub">Another place to sell, at the same prices. Upkeep {MARKET_UPKEEP}g per bill.</span>
             </button>
             <div className="palette-item supplier-row">
               <span className="palette-top">
@@ -386,17 +384,26 @@ export function FlowGame({ scenario, onExit }: { scenario: ScenarioConfig; onExi
           </button>
 
           <h3>Borrow</h3>
-            {FLOW_LOAN_OFFERS.map((o) => (
-              <button key={o.id} className="palette-item" disabled={hasArrears(state)} onClick={() => cmd({ kind: 'takeLoan', offerId: o.id, ...spawnPoint() })}>
-                <span className="palette-top">
-                  <b>{o.label}</b>
-                  <span className="cost up">+{fmt(o.principal)}g</span>
-                </span>
-                <span className="palette-sub">
-                  {o.installmentPerCycle}g every bill × {o.termCycles} = {fmt(o.totalRepay)}g
-                </span>
-              </button>
-            ))}
+            {FLOW_LOAN_OFFERS.map((o) => {
+              const why = loanBlocker(state, o.id);
+              return (
+                <button
+                  key={o.id}
+                  className="palette-item"
+                  disabled={!!why}
+                  title={why ?? undefined}
+                  onClick={() => cmd({ kind: 'takeLoan', offerId: o.id, ...spawnPoint() })}
+                >
+                  <span className="palette-top">
+                    <b>{o.label}</b>
+                    <span className="cost up">+{fmt(o.principal)}g</span>
+                  </span>
+                  <span className="palette-sub">
+                    {why ?? `${o.installmentPerCycle}g every bill × ${o.termCycles} = ${fmt(o.totalRepay)}g`}
+                  </span>
+                </button>
+              );
+            })}
             {debt(state) > 0 && (
               <div className="debt-line">
                 Owed: <b>{fmt(debt(state))}g</b>
@@ -604,12 +611,34 @@ function LicenseTree({
   );
 }
 
+// Equity, with debt against its limit (DEBT_LIMIT_MULTIPLE × equity) in the
+// hint and as a thin bar that warms up near the line.
+function EquityMeter({ state }: { state: FlowState }) {
+  const eq = equity(state);
+  const owed = debt(state);
+  const limit = debtLimit(state);
+  const share = limit > 0 ? owed / limit : owed > 0 ? Infinity : 0;
+  const tone = share > 1 ? ' over' : share > 0.8 ? ' near' : '';
+  return (
+    <div
+      className={'stat debt-meter' + tone}
+      title={`Equity: everything you own minus everything you owe.\nDebt ${fmt(owed)}g of a ${fmt(limit)}g limit (${DEBT_LIMIT_MULTIPLE}× equity).\nOver the limit at two bills in a row and the creditors liquidate.`}
+    >
+      <span className="stat-label">{state.insolvent ? 'Equity · over limit' : 'Equity'}</span>
+      <span className="stat-value">{fmt(eq)}g</span>
+      <span className="debt-bar" aria-label={`Debt ${fmt(owed)}g of a ${fmt(limit)}g limit`}>
+        <span className="debt-fill" style={{ width: `${Math.min(100, share * 100)}%` }} />
+      </span>
+    </div>
+  );
+}
+
 function BankruptcyReport({ report, onClose }: { report: FlowBankruptcy; onClose: () => void }) {
   return (
     <div className="report-overlay" role="dialog" aria-modal="true" aria-labelledby="bankrupt-title">
       <div className="report-card flow-bankrupt">
         <h2 id="bankrupt-title">Bankrupt{report.count > 1 ? ` (×${report.count})` : ''}</h2>
-        <p>You owed more than everything you owned for two bills running, so the creditors liquidated.</p>
+        <p>Your debt was over {DEBT_LIMIT_MULTIPLE}× your equity for two bills running, so the creditors liquidated.</p>
         <dl className="facts">
           <dt>Money seized</dt>
           <dd>{fmt(report.seizedG)}g</dd>
@@ -739,23 +768,22 @@ function WirePath({
   onSelect: () => void;
 }) {
   const d = curve(a, b);
-  const cap = wireCapacity(wire);
   const money = wire.productId === MONEY;
-  const load = pay ? 0 : wire.movedLastSec / cap;
-  // Dots travel faster the more the wire carries.
-  const dur = wire.movedLastSec > 0 ? Math.max(0.35, 1.6 - load * 1.2) : 0;
+  // Dots travel faster the more the wire carries (money counts in tens of gold).
+  const busy = Math.min(1, wire.movedLastSec / (money ? 100 : 10));
+  const dur = wire.movedLastSec > 0 ? Math.max(0.35, 1.6 - busy * 1.2) : 0;
   const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
   const on = isOn(wire);
-  const label = !on ? 'off' : pay ? 'pays' : money ? `${fmt(wire.movedLastSec)}g/s` : `${wire.movedLastSec}/${cap}`;
+  const label = !on ? 'off' : pay ? 'pays' : money ? `${fmt(wire.movedLastSec)}g/s` : `${wire.movedLastSec}/s`;
   const labelW = Math.max(44, label.length * 6.5 + 12);
   return (
     <g
-      className={'wire' + (selected ? ' selected' : '') + (load >= 1 ? ' maxed' : '') + (pay ? ' pay' : '') + (on ? '' : ' off')}
+      className={'wire' + (selected ? ' selected' : '') + (pay ? ' pay' : '') + (on ? '' : ' off')}
       onPointerDown={(e) => (e.stopPropagation(), onSelect())}
     >
       <path className="wire-hit" d={d} />
-      <path className="wire-base" d={d} stroke={color} strokeWidth={2 + wire.level} />
-      {dur > 0 && <path className="wire-flow" d={d} stroke={color} strokeWidth={2 + wire.level} style={{ animationDuration: `${dur}s` }} />}
+      <path className="wire-base" d={d} stroke={color} strokeWidth={3} />
+      {dur > 0 && <path className="wire-flow" d={d} stroke={color} strokeWidth={3} style={{ animationDuration: `${dur}s` }} />}
       <g transform={`translate(${mid.x}, ${mid.y})`}>
         <rect className="wire-label-bg" x={-labelW / 2} y={-9} width={labelW} height={18} rx={9} />
         <text className="wire-label" textAnchor="middle" dy={4}>
@@ -934,14 +962,21 @@ function NodeCard({
   );
 }
 
-// What one unit on this wire fetches at the market right now; red while the good is glutted.
+// What one unit on this wire fetches at the market right now, with the
+// direction its trend is heading: green rising, red falling.
 function SalePriceLabel({ state, scenario, productId }: { state: FlowState; scenario: ScenarioConfig; productId: string }) {
-  const now = salePrice(state, scenario, productId);
-  const glutted = now < state.market[productId].price * 0.85;
+  const now = salePrice(state, productId);
+  const t = trendPerBill(state, productId);
+  const dir = t > 0.02 ? ' up' : t < -0.02 ? ' down' : '';
   return (
-    <span className="port-label unit-label" title={`${product(scenario, productId).name}: ${now.toFixed(1)}g per unit`}>
+    <span
+      className="port-label unit-label"
+      title={`${product(scenario, productId).name}: ${now.toFixed(1)}g per unit, trending ${t >= 0 ? '+' : ''}${Math.round(t * 100)}% a bill`}
+    >
       <span className="unit-name">{product(scenario, productId).name}</span>
-      <span className={'unit-price' + (glutted ? ' down' : '')}>{now.toFixed(1)}g each</span>
+      <span className={'unit-price' + dir}>
+        {now.toFixed(1)}g each{dir === ' up' ? ' ▲' : dir === ' down' ? ' ▼' : ''}
+      </span>
     </span>
   );
 }
@@ -1004,7 +1039,7 @@ function BlockInspector({ node, state, scenario, cmd, onClose }: InspectorProps)
             (node.kind === 'supplier'
               ? 'Whatever pays for it can’t afford more stock.'
               : `Waiting on ${inputs.map((i) => product(scenario, i.id).name).join(' and ')}. Wire a producer into it.`)}
-          {node.status === 'blocked' && (outgoing ? 'Output is backed up. Upgrade its wire or add another route.' : 'Output has nowhere to go. Drag from its port to a buyer.')}
+          {node.status === 'blocked' && (outgoing ? 'Output is backed up: what it feeds can’t take any more. Add another buyer.' : 'Output has nowhere to go. Drag from its port to a buyer.')}
           {node.status === 'running' && 'Running smoothly.'}
           {node.status === 'idle' && (node.kind === 'supplier' && node.demand <= 0 ? 'Demand is 0, so it buys nothing.' : 'Warming up.')}
         </p>
@@ -1031,7 +1066,7 @@ function BlockInspector({ node, state, scenario, cmd, onClose }: InspectorProps)
             <dt>Holds</dt>
             <dd>{node.kind === 'facility' ? `${bufferCap(node)} of each` : bufferCap(node)}</dd>
             <dt>Sells for now</dt>
-            <dd>{salePrice(state, scenario, node.productId).toFixed(1)}g each</dd>
+            <dd>{salePrice(state, node.productId).toFixed(1)}g each</dd>
           </>
         )}
         {node.kind === 'supplier' && (
@@ -1283,7 +1318,6 @@ function WireInspector({
   cmd: (c: FlowCommand) => void;
   onClose: () => void;
 }) {
-  const cost = wireUpgradeCost(wire);
   const pay = isPayLink(state, wire);
   const money = wire.productId === MONEY;
   const to = state.nodes.find((n) => n.id === wire.to);
@@ -1291,25 +1325,16 @@ function WireInspector({
     <div className="inspector">
       <InspectorHead title={pay ? 'Payment link' : money ? 'Money line' : `${product(scenario, wire.productId).name} line`} onClose={onClose} />
       {pay && to && <p className="hint">Pays the {to.kind === 'borrower' ? 'installments' : 'upkeep'} of {nodeName(to, scenario)} when each bill falls due.</p>}
-      {money && !pay && <p className="hint">Carries any amount, so it never needs upgrading.</p>}
       {!pay && (
-        <dl className="facts">
-          <dt>Carrying</dt>
-          <dd>{money ? `${fmt(wire.movedLastSec)}g/s` : `${wire.movedLastSec} of ${wireCapacity(wire)}/s`}</dd>
-          {!money && (
-            <>
-              <dt>Level</dt>
-              <dd>{wire.level}</dd>
-            </>
-          )}
-        </dl>
+        <>
+          <p className="hint">Carries any amount; only what it feeds can hold it back.</p>
+          <dl className="facts">
+            <dt>Carrying</dt>
+            <dd>{money ? `${fmt(wire.movedLastSec)}g/s` : `${wire.movedLastSec}/s`}</dd>
+          </dl>
+        </>
       )}
       <div className="inspector-actions">
-        {!money && (
-          <button className="primary" disabled={state.cash < cost} onClick={() => cmd({ kind: 'upgradeWire', wireId: wire.id })}>
-            Double capacity · {fmt(cost)}g
-          </button>
-        )}
         <button onClick={() => cmd({ kind: 'toggleWire', wireId: wire.id })}>{isOn(wire) ? 'Switch off' : 'Switch on'}</button>
         <button
           onClick={() => {
@@ -1329,29 +1354,33 @@ function Overview({ state, scenario, onClose }: { state: FlowState; scenario: Sc
     <div className="inspector">
       <InspectorHead title="How it works" onClose={onClose} />
       <ol className="howto">
-        <li>Drag from a block’s output port to another block to lay a wire ({WIRE_COST}g).</li>
+        <li>Drag from a block’s output port to another block to lay a wire. Wires are free and carry any amount.</li>
         <li>Goods flow from farms through processors into a Market. The Market holds its takings until a gold money wire carries them to a Wallet or the Budget.</li>
         <li>Every block’s upkeep is paid by a Wallet or the Budget wired into it (Wallets first). A block nobody pays stops.</li>
         <li>The Budget pays for building. Fund a Wallet when you open it, or move money from the Wallet’s panel.</li>
         <li>A loan pays its whole amount into the Budget. Its block collects each installment from a Wallet or the Budget wired into it, or you can pay it off in full from its panel.</li>
-        <li>Flooding the market with one good drops its price. Process it into something worth more.</li>
+        <li>Prices drift with a random trend that changes every bill, pulled back toward normal over time. Sell more when a good is high.</li>
         <li>Bills fall due every {FLOW_SETTLE_SEC}s.</li>
         <li>
-          Equity is everything you own minus everything you owe. Below 0 at a bill and you’re insolvent; still below at the next bill and
-          the creditors liquidate, leaving you your cheapest Farm and Market and a Wallet with a little money.
+          Equity is everything you own minus everything you owe. You may owe up to {DEBT_LIMIT_MULTIPLE}× your equity, and a loan that
+          would take you past that is refused. Over the limit at a bill is a warning; still over at the next bill and the creditors
+          liquidate, leaving you your cheapest Farm and Market and a Wallet with a little money.
         </li>
       </ol>
       <h3>Prices</h3>
       <table className="price-table">
         <tbody>
           {scenario.products.map((p) => {
-            const now = salePrice(state, scenario, p.id);
-            const spot = state.market[p.id].price;
+            const now = salePrice(state, p.id);
+            const t = trendPerBill(state, p.id);
+            const pct = Math.round(t * 100);
             return (
               <tr key={p.id}>
                 <td>{p.name}</td>
                 <td className="num">{now.toFixed(1)}g</td>
-                <td className={'num ' + (now < spot * 0.85 ? 'down' : '')}>{now < spot * 0.85 ? `glut −${Math.round((1 - now / spot) * 100)}%` : ''}</td>
+                <td className={'num ' + (pct > 1 ? 'up' : pct < -1 ? 'down' : '')} title="Trend over one bill; it changes every bill">
+                  {pct > 1 ? `▲ +${pct}%` : pct < -1 ? `▼ ${pct}%` : '–'}
+                </td>
               </tr>
             );
           })}
