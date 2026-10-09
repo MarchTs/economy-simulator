@@ -30,6 +30,7 @@ import {
 } from './engine/sim';
 import { SCENARIOS } from './scenarios/simScenarios';
 import { PriceChart } from './ui/PriceChart';
+import { FlowGame } from './flow/FlowGame';
 
 const SEED = 1234;
 const fmt = (n: number) => Math.round(n).toLocaleString();
@@ -40,7 +41,7 @@ const mmss = (sec: number) => {
 };
 
 export default function App() {
-  const [pick, setPick] = useState<{ scenario: ScenarioConfig; sandbox: boolean } | null>(null);
+  const [pick, setPick] = useState<{ scenario: ScenarioConfig; sandbox: boolean; flow?: boolean } | null>(null);
 
   if (!pick) {
     return (
@@ -58,6 +59,11 @@ export default function App() {
                 </button>
                 <button onClick={() => setPick({ scenario: s, sandbox: true })}>Sandbox</button>
               </div>
+              <div className="scenario-actions">
+                <button onClick={() => setPick({ scenario: s, sandbox: false, flow: true })}>
+                  Owe &amp; Flow<span className="mode-pill">new</span>
+                </button>
+              </div>
             </div>
           ))}
         </div>
@@ -65,6 +71,8 @@ export default function App() {
       </div>
     );
   }
+
+  if (pick.flow) return <FlowGame key={pick.scenario.id} scenario={pick.scenario} onExit={() => setPick(null)} />;
 
   return <Game key={pick.scenario.id + pick.sandbox} scenario={pick.scenario} sandbox={pick.sandbox} onExit={() => setPick(null)} />;
 }
